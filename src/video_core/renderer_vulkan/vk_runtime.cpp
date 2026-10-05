@@ -758,6 +758,11 @@ void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size
 }
 
 void Runtime::FlushBarriers() {
+    FlushBarriers(vk::PipelineStageFlagBits2::eAllCommands,
+                  vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite);
+}
+
+void Runtime::FlushBarriers(vk::PipelineStageFlags2 dst_stage, vk::AccessFlags2 dst_access) {
     vk::DependencyInfo dep_info{};
 
     if (memory_barrier.srcStageMask) {
@@ -773,6 +778,8 @@ void Runtime::FlushBarriers() {
         return;
     }
 
+    memory_barrier.dstStageMask = dst_stage;
+    memory_barrier.dstAccessMask = dst_access;
     scheduler.EndRendering();
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.pipelineBarrier2(dep_info);

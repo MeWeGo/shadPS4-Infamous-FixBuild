@@ -428,7 +428,12 @@ void Rasterizer::DispatchDirect() {
         if (!last_work_compute) {
             Common::Perf::Count(Common::Perf::Counter::SwitchBarriers);
         }
-        runtime.FlushBarriers();
+        // Direct dispatches only run compute shaders (no indirect-arg read), so the
+        // barrier's destination is narrowed from AllCommands: unrelated graphics stages
+        // keep flowing while particle dispatches synchronize among themselves.
+        runtime.FlushBarriers(vk::PipelineStageFlagBits2::eComputeShader,
+                              vk::AccessFlagBits2::eShaderRead |
+                                  vk::AccessFlagBits2::eShaderWrite);
     }
 
     scheduler.EndRendering();

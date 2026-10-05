@@ -93,6 +93,13 @@ public:
 
     void FlushBarriers();
 
+    /// Same, but the barrier's destination is narrowed to the stages/accesses of the work
+    /// about to be recorded (e.g. a direct dispatch only needs compute shader stages).
+    /// A full AllCommands destination stalls the whole pipeline; narrowing it lets
+    /// unrelated stages overlap. Callers must ensure dst covers every stage/access the
+    /// following commands (up to the next barrier) use.
+    void FlushBarriers(vk::PipelineStageFlags2 dst_stage, vk::AccessFlags2 dst_access);
+
 private:
     const Instance& instance;
     Scheduler& scheduler;
