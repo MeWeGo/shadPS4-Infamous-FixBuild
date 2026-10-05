@@ -167,6 +167,12 @@ struct ImageResource {
 
     u32 NumBindings(const auto& info) const {
         const AmdGpu::Image tsharp = GetSharp(info);
+        return NumBindings(tsharp);
+    }
+
+    /// Same, reusing an already-fetched sharp instead of fetching it twice per
+    /// image per draw (the fetch walks user-data and validates formats).
+    u32 NumBindings(const AmdGpu::Image& tsharp) const {
         return (mip_fallback_mode == MipStorageFallbackMode::DynamicIndex)
                    ? (tsharp.last_level - tsharp.base_level + 1)
                    : 1;

@@ -162,6 +162,20 @@ private:
     std::array<ImageBinding, AmdGpu::NUM_COLOR_BUFFERS> cb_descs;
     std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc> db_desc;
 
+    /// Memoizes GetSampler (XXH3 + map + LRU touch per sampler per draw).
+    /// Entries are only valid for the sampler generation they were filled in;
+    /// any map change (insert or GC erase) bumps it and invalidates them all.
+    struct SamplerMemo {
+        AmdGpu::Sampler sharp{};
+        bool is_depth{};
+        u64 generation{};
+        vk::Sampler handle{};
+        bool valid{};
+    };
+    static constexpr size_t NumSamplerMemos = 8;
+    std::array<SamplerMemo, NumSamplerMemos> sampler_memos{};
+    size_t next_sampler_memo{};
+
     boost::container::static_vector<vk::DescriptorImageInfo, Shader::NUM_IMAGES> image_infos;
     boost::container::static_vector<vk::DescriptorBufferInfo, Shader::NUM_BUFFERS> buffer_infos;
 

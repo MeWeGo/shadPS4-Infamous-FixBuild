@@ -804,6 +804,7 @@ vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sharp,
         Sampler& sampler = slot_samplers[it->second];
         sampler.hash = hash;
         sampler_lru_cache.Insert(sampler, gc_tick);
+        ++sampler_generation;
     }
 
     Sampler& sampler = slot_samplers[it->second];
@@ -1095,6 +1096,7 @@ void TextureCache::GarbageCollectSamplers() {
         --num_deletions;
         sampler_lru_cache.Free(sampler);
         samplers.erase(sampler.hash);
+        ++sampler_generation;
         const auto sampler_id = slot_samplers.GetSlotId(sampler);
         slot_samplers.Erase(sampler_id);
         return false;

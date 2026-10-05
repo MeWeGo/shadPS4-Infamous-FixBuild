@@ -995,7 +995,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         }
 
         const Shader::MipStorageFallbackMode mip_fallback_mode = image_desc.mip_fallback_mode;
-        const u32 num_bindings = image_desc.NumBindings(stage);
+        const u32 num_bindings = image_desc.NumBindings(tsharp);
 
         for (auto i = 0; i < num_bindings; i++) {
             auto& [image_id, desc] = image_bindings[num_images++];
@@ -1113,10 +1113,12 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         binding.unified += array_size;
     }
 
+    const auto ta_bc_base = liverpool->regs.ta_bc_base;
+    const u64 sampler_gen = texture_cache.SamplerGeneration();
     for (const auto& sampler : stage.samplers) {
         auto ssharp = sampler.GetSharp(stage);
         if (!ssharp.Valid() || (ssharp.border_color_type.Value() == AmdGpu::BorderColor::Custom &&
-                                liverpool->regs.ta_bc_base.Address() == 0)) {
+                                ta_bc_base.Address() == 0)) {
             LOG_WARNING(Render_Vulkan,
                         "Rejecting invalid S# max_aniso={}, filter_mode={}, mip_filter={}, "
                         "border_color_type={}, border_color_base={:#x}",
@@ -1124,11 +1126,29 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                         static_cast<u32>(ssharp.filter_mode.Value()),
                         static_cast<u32>(ssharp.mip_filter.Value()),
                         static_cast<u32>(ssharp.border_color_type.Value()),
-                        liverpool->regs.ta_bc_base.Address());
+                        ta_bc_base.Address());
             ssharp = AmdGpu::Sampler{};
         }
-        const auto vk_sampler =
-            texture_cache.GetSampler(ssharp, liverpool->regs.ta_bc_base, sampler.is_depth);
+        vk::Sampler vk_sampler{};
+        bool memo_hit{};
+        for (const auto& memo : sampler_memos) {
+            if (memo.valid && memo.generation == sampler_gen && memo.is_depth == sampler.is_depth &&
+                memo.sharp == ssharp) {
+                vk_sampler = memo.handle;
+                memo_hit = true;
+                break;
+            }
+        }
+        if (!memo_hit) {
+            vk_sampler = texture_cache.GetSampler(ssharp, ta_bc_base, sampler.is_depth);
+            auto& memo = sampler_memos[next_sampler_memo];
+            next_sampler_memo = (next_sampler_memo + 1) % NumSamplerMemos;
+            memo.sharp = ssharp;
+            memo.is_depth = sampler.is_depth;
+            memo.generation = sampler_gen;
+            memo.handle = vk_sampler;
+            memo.valid = true;
+        }
         image_infos.emplace_back(vk_sampler, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
         auto& set_write = set_writes[set_write_index++];
         set_write.dstSet = VK_NULL_HANDLE;
