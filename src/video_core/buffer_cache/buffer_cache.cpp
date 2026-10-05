@@ -125,8 +125,11 @@ std::tuple<const Buffer*, VAddr, VAddr> BufferCache::GetReadbackWindow(VAddr dev
     const auto* arena = GetArena(first_block, last_block);
 
     // GPU-modified ranges come as many small scattered islands,
-    // so the download is widened to a window around the request
-    constexpr u64 WindowSize = 512_KB;
+    // so the download is widened to a window around the request.
+    // inFAMOUS Second Son faults hundreds of thousands of times while streaming; a 1 MB
+    // window halves the fault count vs 512 KB at the cost of more bytes per copy, and the
+    // prefetch backoff still drops windows whose copies keep going stale.
+    constexpr u64 WindowSize = 1_MB;
     const VAddr arena_end = arena->cpu_addr + arena->size_bytes;
     const VAddr window_start =
         std::max<VAddr>(Common::AlignDown(device_addr, WindowSize), arena->cpu_addr);
