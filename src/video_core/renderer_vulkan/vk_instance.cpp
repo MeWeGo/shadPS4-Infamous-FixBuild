@@ -361,6 +361,12 @@ bool Instance::CreateDevice() {
         LOG_CRITICAL(Render_Vulkan, "Physical device reported no queues.");
         return false;
     }
+    for (std::size_t i = 0; i < family_properties.size(); i++) {
+        const auto& props = family_properties[i];
+        LOG_INFO(Render_Vulkan, "Queue family {}: flags={} count={} timestampValidBits={}",
+                 i, vk::to_string(props.queueFlags), props.queueCount,
+                 props.timestampValidBits);
+    }
 
     bool graphics_queue_found = false;
     for (std::size_t i = 0; i < family_properties.size(); i++) {
@@ -376,10 +382,22 @@ bool Instance::CreateDevice() {
         return false;
     }
 
-    static constexpr std::array queue_priorities = {1.0f};
+    // A second queue in the same family runs compute work beside the graphics work
+    // without queue family ownership transfers. Falls back to no second queue.
+    compute_queue_family_index = ~0u;
+    u32 compute_queue_index = 0;
+    if (family_properties[queue_family_index].queueCount >= 2) {
+        compute_queue_family_index = queue_family_index;
+        compute_queue_index = 1;
+    }
+    compute_queue_index_ = compute_queue_index;
+
+    static constexpr std::array queue_priorities = {1.0f, 1.0f};
+    const u32 graphics_queue_count =
+        (compute_queue_family_index == queue_family_index) ? 2u : 1u;
     const vk::DeviceQueueCreateInfo queue_info = {
         .queueFamilyIndex = queue_family_index,
-        .queueCount = static_cast<u32>(queue_priorities.size()),
+        .queueCount = graphics_queue_count,
         .pQueuePriorities = queue_priorities.data(),
     };
 
@@ -590,6 +608,13 @@ bool Instance::CreateDevice() {
 
     graphics_queue = device->getQueue(queue_family_index, 0);
     present_queue = device->getQueue(queue_family_index, 0);
+    if (compute_queue_family_index != ~0u) {
+        compute_queue = device->getQueue(compute_queue_family_index, compute_queue_index_);
+        LOG_INFO(Render_Vulkan, "Compute queue: family {} index {}", compute_queue_family_index,
+                 compute_queue_index_);
+    } else {
+        LOG_INFO(Render_Vulkan, "No second compute queue available, compute stays serialized");
+    }
 
     if (calibrated_timestamps) {
         const auto [time_domains_result, time_domains] =

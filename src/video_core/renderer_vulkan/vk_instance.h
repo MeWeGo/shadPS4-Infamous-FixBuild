@@ -71,6 +71,20 @@ public:
         return graphics_queue;
     }
 
+    /// A second queue beside the graphics queue for compute work, if the device
+    /// has one in the same family (no ownership transfers needed). Null otherwise.
+    bool HasComputeQueue() const {
+        return !!compute_queue;
+    }
+
+    u32 GetComputeQueueFamilyIndex() const {
+        return compute_queue_family_index;
+    }
+
+    vk::Queue GetComputeQueue() const {
+        return compute_queue;
+    }
+
     vk::Queue GetPresentQueue() const {
         return present_queue;
     }
@@ -508,6 +522,9 @@ private:
     VmaAllocator allocator{};
     vk::Queue present_queue;
     vk::Queue graphics_queue;
+    vk::Queue compute_queue{};
+    u32 compute_queue_family_index{~0u};
+    u32 compute_queue_index_{0};
     std::vector<vk::PhysicalDevice> physical_devices;
     std::vector<std::string> available_extensions;
     std::unordered_map<vk::Format, vk::FormatProperties3> format_properties;
