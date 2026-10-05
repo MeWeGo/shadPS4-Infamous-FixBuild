@@ -658,6 +658,7 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
 
     const auto start = std::chrono::steady_clock::now();
     const auto ir_program = Shader::TranslateProgram(code, pools, info, runtime_info, profile);
+    const auto after_translate = std::chrono::steady_clock::now();
     auto spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, ir_program, binding);
     const auto elapsed = std::chrono::steady_clock::now() - start;
     Common::Perf::Record(Common::Perf::Stall::ShaderTranslate,
@@ -665,6 +666,14 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     if (elapsed >= std::chrono::milliseconds{3}) {
         LOG_INFO(Render_Vulkan, "Translated {} shader {:#x} in {:.1f} ms", info.hw_stage,
                  info.pgm_hash, std::chrono::duration<double, std::milli>(elapsed).count());
+    }
+    if (elapsed >= std::chrono::milliseconds{1}) {
+        const auto translate_ms =
+            std::chrono::duration<double, std::milli>(after_translate - start).count();
+        const auto emit_ms =
+            std::chrono::duration<double, std::milli>(elapsed).count() - translate_ms;
+        LOG_INFO(Render_Vulkan, "Translate breakdown {} shader {:#x}: front {:.1f} ms + SPIRV {:.1f} ms",
+                 info.hw_stage, info.pgm_hash, translate_ms, emit_ms);
     }
     if ((info.uses_buffer_atomic_float_min_max && !profile.supports_buffer_fp32_atomic_min_max) ||
         (info.uses_image_atomic_float_min_max && !profile.supports_image_fp32_atomic_min_max)) {
