@@ -258,6 +258,7 @@ void StreamBuffer::AdvanceAndWatch() {
     auto& watch = current_watches[current_watch_cursor++];
     watch.upper_bound = offset;
     watch.tick = tick;
+    watch.compute_tick = pending_compute_tick;
 }
 
 void StreamBuffer::ReserveWatches(std::vector<Watch>& watches, std::size_t grow_size) {
@@ -274,6 +275,11 @@ bool StreamBuffer::WaitPendingOperations(u64 requested_upper_bound, bool allow_w
             return false;
         }
         scheduler.Wait(watch.tick);
+        if (watch.compute_tick != 0 && compute_waiter) {
+            if (!compute_waiter(watch.compute_tick, allow_wait)) {
+                return false;
+            }
+        }
         wait_bound = watch.upper_bound;
         ++wait_cursor;
     }

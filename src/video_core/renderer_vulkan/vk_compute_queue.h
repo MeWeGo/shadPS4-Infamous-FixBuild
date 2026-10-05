@@ -50,6 +50,16 @@ public:
         return semaphore.CurrentTick();
     }
 
+    /// The tick the next Submit() will signal. Only valid with a single
+    /// submitter (the GPU thread), used to tag stream watches before recording.
+    [[nodiscard]] u64 ReserveTick() const noexcept {
+        return semaphore.CurrentTick();
+    }
+
+    [[nodiscard]] bool IsFree(u64 tick) const noexcept {
+        return semaphore.IsFree(tick);
+    }
+
 private:
     const Instance& instance;
     vk::Queue queue{};

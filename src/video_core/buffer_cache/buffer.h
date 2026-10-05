@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cstddef>
+#include <functional>
 #include <optional>
 #include <span>
 #include <string_view>
@@ -150,6 +151,21 @@ struct StreamBuffer : public Buffer {
         return last_tick;
     }
 
+    /// Tags subsequent commits with a compute-timeline tick (0 clears). Used when
+    /// dispatches routed to the async compute queue reference stream memory: reuse
+    /// must wait for the compute timeline too, not just the graphics one.
+    void SetPendingComputeTick(u64 tick) noexcept {
+        pending_compute_tick = tick;
+    }
+
+    /// Called when stream memory may be reused while compute work referencing it
+    /// is still in flight. Returns false instead of waiting when allow_wait is
+    /// false and the tick isn't complete. Unset by default; the rasterizer sets
+    /// it once the async compute queue exists.
+    void SetComputeWaiter(std::function<bool(u64, bool)> waiter) {
+        compute_waiter = std::move(waiter);
+    }
+
     /// Maps and commits a memory region with user provided data
     u64 Copy(auto src, size_t size, size_t alignment = 0) {
         const auto [data, offset] = Map(size, alignment);
@@ -163,6 +179,8 @@ private:
     struct Watch {
         u64 tick{};
         u64 upper_bound{};
+        /// Async-compute timeline tick referencing this region, 0 if none.
+        u64 compute_tick{};
     };
 
     /// Aligns, wraps if needed and waits for the GPU. On success mapped_size is set and the
@@ -184,6 +202,8 @@ private:
     u64 offset{};
     u64 mapped_size{};
     u64 last_tick{};
+    u64 pending_compute_tick{};
+    std::function<bool(u64, bool)> compute_waiter{};
     std::vector<Watch> current_watches;
     std::size_t current_watch_cursor{};
     std::optional<size_t> invalidation_mark;

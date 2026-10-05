@@ -64,6 +64,16 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
         runtime.FlushBarriers();
         buffer_cache.SubmitPendingArenaBinds(info);
     });
+    buffer_cache.GetStreamBuffer().SetComputeWaiter([this](u64 tick, bool allow_wait) {
+        if (compute_queue.IsFree(tick)) {
+            return true;
+        }
+        if (!allow_wait) {
+            return false;
+        }
+        compute_queue.Wait(tick);
+        return true;
+    });
 }
 
 Rasterizer::~Rasterizer() = default;
