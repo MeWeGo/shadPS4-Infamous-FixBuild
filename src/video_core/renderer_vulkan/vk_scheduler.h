@@ -549,6 +549,13 @@ public:
         return work_since_submit;
     }
 
+    /// Whether the open session recorded uploads. They live in the upload
+    /// command buffer submitted with the next graphics submit, so async
+    /// consumers must flush first even when no draws/dispatches piled up.
+    [[nodiscard]] bool HasOpenUpload() const noexcept {
+        return !sessions.empty() && sessions.back().has_upload;
+    }
+
     /// Returns true when a tick has been triggered by the GPU.
     [[nodiscard]] bool IsFree(u64 tick) noexcept {
         if (work_semaphore.IsFree(tick)) {

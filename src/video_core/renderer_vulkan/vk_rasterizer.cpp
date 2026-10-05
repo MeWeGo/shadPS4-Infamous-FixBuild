@@ -456,9 +456,7 @@ void Rasterizer::RouteComputeDispatch(const ComputePipeline* pipeline) {
     if (!BindResources(pipeline)) {
         // Resolve the reservation so tagged watches complete: empty submit.
         stream.SetPendingComputeTick(0);
-        if (scheduler.WorkSinceSubmit() > 0) {
-            scheduler.Flush();
-        }
+        FlushGraphicsForCompute();
         const u64 gtick =
             scheduler.CurrentTick() > 0 ? scheduler.CurrentTick() - 1 : 0;
         const std::pair<vk::Semaphore, u64> gfx_wait{scheduler.GetWorkSemaphore()->Handle(),
@@ -470,9 +468,7 @@ void Rasterizer::RouteComputeDispatch(const ComputePipeline* pipeline) {
     }
     // Hand open graphics work (e.g. uploads recorded above) to the GPU first so
     // the compute submission below can wait for an already-submitted tick.
-    if (scheduler.WorkSinceSubmit() > 0) {
-        scheduler.Flush();
-    }
+    FlushGraphicsForCompute();
     vk::CommandBuffer cb = compute_queue.Begin();
     cb.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
     cb.pushConstants(pipeline->GetLayout(), vk::ShaderStageFlagBits::eCompute, 0u,
@@ -513,6 +509,12 @@ void Rasterizer::ResetComputeBindings() {
     bound_images.clear();
     bound_buffers.clear();
     needs_barrier = false;
+}
+
+void Rasterizer::FlushGraphicsForCompute() {
+    if (scheduler.WorkSinceSubmit() > 0 || scheduler.HasOpenUpload()) {
+        scheduler.Flush();
+    }
 }
 
 void Rasterizer::DispatchDirect() {

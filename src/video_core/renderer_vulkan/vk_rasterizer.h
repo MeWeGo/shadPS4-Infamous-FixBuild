@@ -140,6 +140,9 @@ private:
     /// Clears bindings after a routed dispatch without touching the runtime
     /// barrier tracking (visibility comes from timeline waits instead).
     void ResetComputeBindings();
+    /// Submits open graphics work (recorded draws/dispatches or uploads) so an
+    /// async compute submission can wait for an already-submitted tick.
+    void FlushGraphicsForCompute();
 
     void BindVertexBuffers(const GraphicsPipeline* pipeline);
     void BindIndexBuffer(u32 index_offset = 0);
