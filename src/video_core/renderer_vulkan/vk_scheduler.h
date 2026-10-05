@@ -499,6 +499,16 @@ public:
         }
     }
 
+    /// Dispatches end any open rendering anyway, so piled-up draws/dispatches are submitted
+    /// without a render-state check. Compute-heavy scenes (inFAMOUS cutscenes: 100+ dispatches,
+    /// 2 draws) otherwise build huge command buffers while the GPU idles and readbacks wait.
+    void SubmitIfWorkPiledUp() {
+        static constexpr u32 PiledUpWork = 1024;
+        if (work_since_submit >= PiledUpWork) {
+            Flush();
+        }
+    }
+
     /// Returns the current pipeline dynamic state tracking.
     DynamicState& GetDynamicState() {
         return dynamic_state;

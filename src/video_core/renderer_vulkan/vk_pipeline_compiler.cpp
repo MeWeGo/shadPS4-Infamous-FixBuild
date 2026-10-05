@@ -96,7 +96,13 @@ bool PipelineCompiler::IsCompilerThread() noexcept {
 
 u32 PipelineCompiler::DefaultNumWorkers() {
     const u32 num_threads = std::max(std::thread::hardware_concurrency(), 2U);
-    return std::clamp(num_threads / 2, 1U, 8U);
+    // inFAMOUS Second Son cutscenes (e.g. the car-lift) bring dozens of new compute shaders at
+    // once at 60-190 ms each. Leave 4 threads for the game/GPU/recorder, use the rest up to 12
+    // to drain the urgent burst faster instead of capping at 8.
+    if (num_threads <= 8) {
+        return std::clamp(num_threads / 2, 1U, 8U);
+    }
+    return std::clamp(num_threads - 4, 4U, 12U);
 }
 
 void PipelineCompiler::WorkerLoop(std::stop_token stop_token) {

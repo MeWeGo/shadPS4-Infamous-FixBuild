@@ -33,9 +33,10 @@ static constexpr size_t STREAM_BUFFER_SIZE = 128_MB;
 static constexpr u64 RESIDENCY_GRANULE_SIZE = 16_MB;
 static constexpr u64 RESIDENCY_CHUNK_SIZE = 256_MB;
 // Memory game threads read back is copied back ahead of them for this long after they last
-// faulted on it, for at most this many windows of it.
+// faulted on it, for at most this many windows of it. inFAMOUS Second Son re-reads more
+// distinct windows per frame while streaming the city than fit in 64, so raised to 96.
 static constexpr auto HotWindowLife = std::chrono::seconds{5};
-static constexpr size_t MaxHotWindows = 64;
+static constexpr size_t MaxHotWindows = 96;
 // A window whose copies ahead go stale is skipped for up to this many chances to copy it.
 static constexpr u8 MaxPrefetchBackoff = 7;
 

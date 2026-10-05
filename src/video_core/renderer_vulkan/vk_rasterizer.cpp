@@ -401,6 +401,9 @@ void Rasterizer::DispatchDirect() {
     RENDERER_TRACE;
 
     scheduler.PopPendingOperations();
+    // Submit piled-up work before discovering/translating the next compute pipeline, so the
+    // GPU and compiler threads drain it while this thread works on the next dispatch.
+    scheduler.SubmitIfWorkPiledUp();
 
     const auto& cs_program = liverpool->GetCsRegs();
     const ComputePipeline* pipeline = pipeline_cache.GetComputePipeline();
@@ -450,6 +453,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     RENDERER_TRACE;
 
     scheduler.PopPendingOperations();
+    scheduler.SubmitIfWorkPiledUp();
 
     const auto& cs_program = liverpool->GetCsRegs();
     const ComputePipeline* pipeline = pipeline_cache.GetComputePipeline();
