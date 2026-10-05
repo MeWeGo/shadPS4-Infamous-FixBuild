@@ -176,6 +176,7 @@ void BufferCache::OnBackingWritten(VAddr device_addr, u64 size) {
 }
 
 std::shared_ptr<BufferCache::Readback> BufferCache::StartReadback(VAddr device_addr, u64 size) {
+    CheckComputeOverlap(device_addr, size);
     PruneReadbacks();
     const auto [arena, window_start, window_end] = GetReadbackWindow(device_addr, size);
 
@@ -503,7 +504,40 @@ u64 BufferCache::CollectDownloads(const Buffer* arena, VAddr device_addr, u64 si
     return total_size_bytes;
 }
 
+void BufferCache::NoteComputeWrites(VAddr start, VAddr end, u64 tick) {
+    if (start >= end || tick == 0) {
+        return;
+    }
+    PruneComputeWrites();
+    compute_writes.push_back({start, end, tick});
+}
+
+u64 BufferCache::ConsumePendingComputeWait() noexcept {
+    return std::exchange(pending_compute_wait, 0);
+}
+
+void BufferCache::CheckComputeOverlap(VAddr addr, u64 size) {
+    if (compute_writes.empty() || size == 0) {
+        return;
+    }
+    const VAddr end = addr + size;
+    for (const auto& write : compute_writes) {
+        if (write.start < end && addr < write.end) {
+            pending_compute_wait = std::max(pending_compute_wait, write.tick);
+        }
+    }
+}
+
+void BufferCache::PruneComputeWrites() {
+    if (compute_writes.empty() || !compute_is_free) {
+        return;
+    }
+    std::erase_if(compute_writes,
+                  [&](const ComputeWrite& write) { return compute_is_free(write.tick); });
+}
+
 void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size) {
+    CheckComputeOverlap(device_addr, size);
     DownloadCopies copies;
     const u64 total_size_bytes = CollectDownloads(arena, device_addr, size, copies);
     if (total_size_bytes == 0) {
@@ -531,6 +565,7 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,
                                                         bool is_written, bool is_texel_buffer,
                                                         bool is_read_tracked) {
+    CheckComputeOverlap(device_addr, size);
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
     if (!is_written && size <= STREAM_THRESHOLD && !IsRegionGpuModified(device_addr, size)) {
         // Memory the GPU has an up to date copy of is bound from that copy rather than copied
@@ -790,6 +825,7 @@ std::pair<vk::DeviceMemory, u64> BufferCache::AllocateResidency(u64 size) {
 
 bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size,
                                     bool is_written, bool is_texel_buffer) {
+    CheckComputeOverlap(device_addr, size);
     boost::container::small_vector<vk::BufferCopy, 4> copies;
     size_t total_size_bytes{};
     memory_tracker->ForEachUploadRange(device_addr, size, is_written, [&](u64 addr, u64 size) {
@@ -814,6 +850,7 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
 }
 
 bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_addr, u32 size) {
+    CheckComputeOverlap(device_addr, size);
     if (auto type = texture_cache.IsMeta(device_addr)) {
         if (*type == TextureCache::MetaType::HTile) {
             static constexpr u32 ZmaskUncompressed = 0xf;

@@ -42,7 +42,15 @@ u64 ComputeQueue::Submit(std::span<const std::pair<vk::Semaphore, u64>> waits) {
     std::vector<vk::Semaphore> wait_semas;
     std::vector<u64> wait_values;
     std::vector<vk::PipelineStageFlags> wait_masks;
-    wait_semas.reserve(waits.size());
+    // Chain submissions in order: later dispatches observe earlier ones without
+    // any barrier tracking on this side. Each routed dispatch gets its own
+    // command buffer for now, so no in-buffer barriers are needed either.
+    if (last_tick != 0) {
+        wait_semas.push_back(signal_sema);
+        wait_values.push_back(last_tick);
+        wait_masks.push_back(vk::PipelineStageFlagBits::eAllCommands);
+    }
+    wait_semas.reserve(wait_semas.size() + waits.size());
     wait_values.reserve(waits.size());
     wait_masks.reserve(waits.size());
     for (const auto& [sema, value] : waits) {
@@ -71,6 +79,8 @@ u64 ComputeQueue::Submit(std::span<const std::pair<vk::Semaphore, u64>> waits) {
     const auto submit_result = queue.submit(submit_info, nullptr);
     ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during compute submit");
     current = vk::CommandBuffer{};
+    last_tick = signal_value;
+    reserved_tick = 0;
     return signal_value;
 }
 

@@ -81,6 +81,12 @@ public:
         return is_compute;
     }
 
+    /// True when descriptors go through push descriptors (no heap allocation),
+    /// set at construction from info, so readable once constructed.
+    [[nodiscard]] bool UsesPushDescriptors() const noexcept {
+        return uses_push_descriptors;
+    }
+
     using DescriptorWrites = std::vector<vk::WriteDescriptorSet>;
     void BindResources(DescriptorWrites& set_writes, const Shader::PushData& push_data) const;
 

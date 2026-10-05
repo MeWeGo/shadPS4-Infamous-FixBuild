@@ -129,6 +129,18 @@ private:
     bool BindResources(const Pipeline* pipeline);
     void BindComputePipeline(const ComputePipeline& pipeline);
 
+    /// Whether a compute dispatch may run on the async compute queue: ready
+    /// pipeline, graphics ring, no images/samplers, push descriptors, no DMA
+    /// and no special buffers outside stream-backed ones.
+    bool IsAsyncComputeEligible(const ComputePipeline& pipeline, const Shader::Info& cs);
+    /// Records a dispatch on the async compute queue instead of the primary
+    /// command buffer. All hazards are handled through compute-timeline waits:
+    /// stream reuse (watches), graphics consumers (pending waits at submit).
+    void RouteComputeDispatch(const ComputePipeline* pipeline);
+    /// Clears bindings after a routed dispatch without touching the runtime
+    /// barrier tracking (visibility comes from timeline waits instead).
+    void ResetComputeBindings();
+
     void BindVertexBuffers(const GraphicsPipeline* pipeline);
     void BindIndexBuffer(u32 index_offset = 0);
 

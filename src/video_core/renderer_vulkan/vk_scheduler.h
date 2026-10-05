@@ -397,6 +397,12 @@ struct DynamicState {
     /// its handle from once it is built.
     void BindComputePipelineOnceBuilt(const CommandRecorder& cmdbuf, const Pipeline& pipeline);
 
+    /// Marks compute push constants unknown (bound on another command buffer),
+    /// forcing the next primary-buffer compute push to re-emit.
+    void InvalidateComputePushConstants() {
+        dirty_state.compute_push_constants = true;
+    }
+
     /// Pushes constants for all graphics or all compute stages, unless the same were pushed for
     /// them last. They mostly are, draw after draw.
     void PushConstants(const CommandRecorder& cmdbuf, vk::PipelineLayout layout, bool compute,
@@ -535,6 +541,12 @@ public:
     /// Returns the current command buffer tick.
     [[nodiscard]] u64 CurrentTick() const noexcept {
         return work_semaphore.CurrentTick();
+    }
+
+    /// Work recorded since the last submit. Used to flush open graphics work
+    /// before handing inputs to another queue.
+    [[nodiscard]] u32 WorkSinceSubmit() const noexcept {
+        return work_since_submit;
     }
 
     /// Returns true when a tick has been triggered by the GPU.

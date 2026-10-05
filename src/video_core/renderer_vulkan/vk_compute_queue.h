@@ -51,7 +51,8 @@ public:
     }
 
     /// The tick the next Submit() will signal. Only valid with a single
-    /// submitter (the GPU thread), used to tag stream watches before recording.
+    /// submitter (the GPU thread): reserve before recording, submit after.
+    /// Used to tag stream watches so reuse waits for the right tick.
     [[nodiscard]] u64 ReserveTick() const noexcept {
         return semaphore.CurrentTick();
     }
@@ -68,6 +69,12 @@ private:
     vk::CommandBuffer current{};
     bool open{};
     std::mutex submit_mutex;
+    /// Last signalled tick. Each submission waits for it, chaining compute
+    /// submissions in order so no explicit barrier tracking is needed between
+    /// dispatches routed here (each gets its own command buffer for now).
+    u64 last_tick{};
+    /// Tick reserved for the submission being recorded, or 0.
+    u64 reserved_tick{};
 };
 
 } // namespace Vulkan

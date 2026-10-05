@@ -61,6 +61,11 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     memory->SetRasterizer(this);
 
     scheduler.SetSubmitCallback([this](Vulkan::SubmitInfo& info) {
+        // Graphics work consuming async-compute results waits for them here, so
+        // dispatches routed to the compute queue overlap instead of serializing.
+        if (const u64 wait = buffer_cache.ConsumePendingComputeWait()) {
+            info.AddWait(compute_queue.GetSemaphore().Handle(), wait);
+        }
         runtime.FlushBarriers();
         buffer_cache.SubmitPendingArenaBinds(info);
     });
@@ -74,6 +79,8 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
         compute_queue.Wait(tick);
         return true;
     });
+    buffer_cache.SetComputeIsFree(
+        [this](u64 tick) { return compute_queue.IsFree(tick); });
 }
 
 Rasterizer::~Rasterizer() = default;
@@ -408,6 +415,106 @@ void Rasterizer::BindComputePipeline(const ComputePipeline& pipeline) {
     }
 }
 
+bool Rasterizer::IsAsyncComputeEligible(const ComputePipeline& pipeline, const Shader::Info& cs) {
+    if (!compute_queue.IsAvailable() || !pipeline.IsReady()) {
+        return false;
+    }
+    // Compute-ring work needs multi-timeline readbacks, indirect dispatches need
+    // producer ordering with their arg buffers: both stay on the graphics queue.
+    if (liverpool->IsComputeRingActive()) {
+        return false;
+    }
+    if (!cs.images.empty() || !cs.samplers.empty()) {
+        return false;
+    }
+    // No heap allocation on the compute path: only push-descriptor pipelines route.
+    if (!pipeline.UsesPushDescriptors()) {
+        return false;
+    }
+    if (cs.uses_dma) {
+        return false;
+    }
+    for (const auto& desc : cs.buffers) {
+        if (!desc.IsSpecial()) {
+            continue;
+        }
+        switch (desc.buffer_type) {
+        case Shader::BufferType::Flatbuf:
+        case Shader::BufferType::ClipPlanes:
+        case Shader::BufferType::SharedMemory:
+            break; // Stream-backed, covered by dual-timeline retirement.
+        default:
+            return false;
+        }
+    }
+    return true;
+}
+
+void Rasterizer::RouteComputeDispatch(const ComputePipeline* pipeline) {
+    auto& stream = buffer_cache.GetStreamBuffer();
+    stream.SetPendingComputeTick(compute_queue.ReserveTick());
+    if (!BindResources(pipeline)) {
+        // Resolve the reservation so tagged watches complete: empty submit.
+        stream.SetPendingComputeTick(0);
+        if (scheduler.WorkSinceSubmit() > 0) {
+            scheduler.Flush();
+        }
+        const u64 gtick =
+            scheduler.CurrentTick() > 0 ? scheduler.CurrentTick() - 1 : 0;
+        const std::pair<vk::Semaphore, u64> gfx_wait{scheduler.GetWorkSemaphore()->Handle(),
+                                                     gtick};
+        compute_queue.Begin();
+        compute_queue.Submit({&gfx_wait, 1});
+        ResetComputeBindings();
+        return;
+    }
+    // Hand open graphics work (e.g. uploads recorded above) to the GPU first so
+    // the compute submission below can wait for an already-submitted tick.
+    if (scheduler.WorkSinceSubmit() > 0) {
+        scheduler.Flush();
+    }
+    vk::CommandBuffer cb = compute_queue.Begin();
+    cb.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
+    cb.pushConstants(pipeline->GetLayout(), vk::ShaderStageFlagBits::eCompute, 0u,
+                     sizeof(push_data), &push_data);
+    if (!set_writes.empty()) {
+        cb.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, pipeline->GetLayout(), 0u,
+                                set_writes);
+    }
+    const auto& cs_program = liverpool->GetCsRegs();
+    cb.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
+    const u64 gtick = scheduler.CurrentTick() > 0 ? scheduler.CurrentTick() - 1 : 0;
+    const std::pair<vk::Semaphore, u64> gfx_wait{scheduler.GetWorkSemaphore()->Handle(), gtick};
+    const u64 ctick = compute_queue.Submit({&gfx_wait, 1});
+    // Tell graphics consumers overlapping these ranges to wait for this tick.
+    // Stream ranges are skipped: stream reuse is fenced by the watch mechanism.
+    const VideoCore::Buffer* stream_buf = &stream;
+    for (const auto [buffer, offset, size, is_written] : bound_buffers) {
+        (void)is_written;
+        if (!buffer || size == 0 || buffer == stream_buf) {
+            continue;
+        }
+        const VAddr base = buffer->cpu_addr + offset;
+        buffer_cache.NoteComputeWrites(base, base + size, ctick);
+    }
+    ResetComputeBindings();
+    // Push constants above bypassed the dynamic state tracking: the next
+    // primary-buffer compute push must re-emit.
+    scheduler.GetDynamicState().InvalidateComputePushConstants();
+    stream.SetPendingComputeTick(0);
+    DebugState.IncDispatch();
+    Common::Perf::Count(Common::Perf::Counter::Dispatches);
+}
+
+void Rasterizer::ResetComputeBindings() {
+    // Like ResetBindings but without runtime barrier tracking: visibility across
+    // timelines comes from semaphore waits, and epochs must stay untouched so
+    // later graphics checks see the same state.
+    bound_images.clear();
+    bound_buffers.clear();
+    needs_barrier = false;
+}
+
 void Rasterizer::DispatchDirect() {
     RENDERER_TRACE;
 
@@ -424,6 +531,11 @@ void Rasterizer::DispatchDirect() {
 
     const auto& cs = pipeline->GetStage(Shader::SwStage::Compute);
     if (ExecuteShaderHLE(cs, liverpool->regs, cs_program, *this)) {
+        return;
+    }
+
+    if (IsAsyncComputeEligible(*pipeline, cs)) {
+        RouteComputeDispatch(pipeline);
         return;
     }
 

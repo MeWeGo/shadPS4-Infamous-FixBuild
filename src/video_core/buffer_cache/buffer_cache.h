@@ -8,6 +8,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -109,6 +110,15 @@ public:
     void NoteComputeRingWrite(VAddr device_addr, u64 size) {
         compute_ring_writes[compute_ring_write_index++ % compute_ring_writes.size()] = {
             device_addr, device_addr + size};
+    }
+
+    /// Notes ranges an async compute submission wrote. Prunes completed ticks.
+    void NoteComputeWrites(VAddr start, VAddr end, u64 tick);
+    /// Returns and clears the compute tick graphics must wait for, 0 if none.
+    u64 ConsumePendingComputeWait() noexcept;
+    /// Tells whether an async-compute timeline tick completed, for pruning.
+    void SetComputeIsFree(std::function<bool(u64)> is_free) {
+        compute_is_free = std::move(is_free);
     }
 
     /// Finds a buffer for the specified region. is_read_tracked tells that the caller reports
@@ -214,6 +224,9 @@ private:
     /// Recovers the copies the GPU wrote over again and frees those that are done. GPU thread.
     void ApplyFinishedReadbacks();
 
+    /// Drops async-compute write records whose ticks completed. GPU thread.
+    void PruneComputeWrites();
+
     /// Writes back copies made ahead as soon as the GPU is done with them.
     void ReadbackThread(std::stop_token token);
 
@@ -278,6 +291,23 @@ private:
     std::array<std::pair<VAddr, VAddr>, 256> compute_ring_writes{};
     size_t compute_ring_write_index{};
     std::chrono::steady_clock::time_point last_readback_report{};
+
+    /// Ranges written by dispatches routed to the async compute queue, with the
+    /// compute-timeline tick that wrote them. Graphics consumers overlapping them
+    /// wait for that tick at the next submit instead of serializing behind the
+    /// dispatches. GPU thread only.
+    struct ComputeWrite {
+        VAddr start{};
+        VAddr end{};
+        u64 tick{};
+    };
+    std::vector<ComputeWrite> compute_writes;
+    /// Latest compute tick graphics was told to wait for, consumed at submit.
+    u64 pending_compute_wait{};
+    /// True when a compute-timeline tick is complete. Set once when async compute exists.
+    std::function<bool(u64)> compute_is_free{};
+    /// Marks graphics to wait for compute work overlapping a range. GPU thread.
+    void CheckComputeOverlap(VAddr addr, u64 size);
 
     std::unique_ptr<FaultManager> fault_manager;
     std::unique_ptr<Buffer> bda_pagetable_buffer;
