@@ -517,16 +517,14 @@ void Rasterizer::RouteComputeDispatch(const ComputePipeline* pipeline) {
     if (ac_mode == 1) {
     const auto& cs_program = liverpool->GetCsRegs();
     cb.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
-    // Trace routed dispatches so a crash can be tied to its shader. First few
-    // always, then periodically: bursts route hundreds per frame.
+    // Trace routed dispatches so a crash can be tied to its shader. Unthrottled
+    // while triaging the scene-load crash; every routed dispatch is logged.
     {
         static std::atomic<u64> routed_count{0};
         const u64 n = routed_count.fetch_add(1, std::memory_order_relaxed);
-        if (n < 20 || n % 500 == 0) {
-            const auto& cs_info = pipeline->GetStage(Shader::SwStage::Compute);
-            LOG_INFO(Render_Vulkan, "Routed dispatch #{}: cs {:#x} dims {}x{}x{}", n,
-                     cs_info.pgm_hash, cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
-        }
+        const auto& cs_info = pipeline->GetStage(Shader::SwStage::Compute);
+        LOG_INFO(Render_Vulkan, "Routed dispatch #{}: cs {:#x} dims {}x{}x{}", n,
+                 cs_info.pgm_hash, cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
     }
     }
     const u64 ctick = compute_queue.Submit(ComputeSubmitWaits());
