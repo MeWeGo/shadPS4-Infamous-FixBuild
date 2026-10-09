@@ -299,7 +299,13 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         if (last_work_compute) {
             Common::Perf::Count(Common::Perf::Counter::SwitchBarriers);
         }
-        runtime.FlushBarriers();
+        // Draws read and write in graphics stages only. A compute dispatch reading the
+        // same memory later issues its own barrier with a compute destination, so the
+        // narrow destination costs nothing in correctness: the src stages the barrier
+        // accumulates (from ResetBindings of the work before) cover whatever wrote.
+        runtime.FlushBarriers(vk::PipelineStageFlagBits2::eAllGraphics,
+                              vk::AccessFlagBits2::eMemoryRead |
+                                  vk::AccessFlagBits2::eMemoryWrite);
     }
 
     pipeline->BindResources(set_writes, push_data);
@@ -381,7 +387,12 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         if (last_work_compute) {
             Common::Perf::Count(Common::Perf::Counter::SwitchBarriers);
         }
-        runtime.FlushBarriers();
+        // Draws, including indirect ones, read and write in graphics stages only
+        // (the draw indirect stage is part of all graphics). A compute dispatch
+        // reading the same memory later issues its own barrier.
+        runtime.FlushBarriers(vk::PipelineStageFlagBits2::eAllGraphics,
+                              vk::AccessFlagBits2::eMemoryRead |
+                                  vk::AccessFlagBits2::eMemoryWrite);
     }
 
     pipeline->BindResources(set_writes, push_data);
