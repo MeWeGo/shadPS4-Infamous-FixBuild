@@ -485,6 +485,21 @@ bool Rasterizer::IsAsyncComputeEligible(const ComputePipeline& pipeline, const S
             return false;
         }
     }
+    // Buffers the dispatch writes that alias cached images are later sampled as
+    // textures on the graphics timeline, which has no compute-wait machinery:
+    // keep those dispatches serialized.
+    for (const auto& desc : cs.buffers) {
+        if (desc.IsSpecial() || !desc.is_written) {
+            continue;
+        }
+        const auto vsharp = desc.GetSharp(cs);
+        if (vsharp.base_address == 0 || vsharp.GetSize() == 0) {
+            continue;
+        }
+        if (texture_cache.FindImageFromRange(vsharp.base_address, vsharp.GetSize(), false)) {
+            return false;
+        }
+    }
     return true;
 }
 
