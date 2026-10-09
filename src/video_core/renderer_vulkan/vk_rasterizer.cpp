@@ -2,11 +2,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/debug.h"
+#include <cstdlib>
+
 #include "common/perf_profiler.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
-#include "core/memory.h"
-#include "shader_recompiler/runtime_info.h"
+#include "core/memory.h"#include "shader_recompiler/runtime_info.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/buffer_cache.h"
@@ -81,6 +82,15 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     });
     buffer_cache.SetComputeIsFree(
         [this](u64 tick) { return compute_queue.IsFree(tick); });
+    buffer_cache.SetComputeFence([this]() -> std::pair<vk::Semaphore, u64> {
+        if (!compute_queue.IsAvailable()) {
+            return {vk::Semaphore{}, 0};
+        }
+        // Last submitted compute tick; 0/... CurrentTick()-1 is always signalled
+        // or about to be by the single submitter.
+        const u64 tick = compute_queue.CurrentTick();
+        return {compute_queue.GetSemaphore().Handle(), tick > 0 ? tick - 1 : 0};
+    });
 }
 
 Rasterizer::~Rasterizer() = default;
@@ -416,6 +426,17 @@ void Rasterizer::BindComputePipeline(const ComputePipeline& pipeline) {
 }
 
 bool Rasterizer::IsAsyncComputeEligible(const ComputePipeline& pipeline, const Shader::Info& cs) {
+    // Kill switch for bisection: SHADPS4_ASYNC_COMPUTE=0 keeps everything on
+    // the graphics queue. Read once; no settings churn.
+    static const bool async_compute_enabled = [] {
+        if (const char* v = std::getenv("SHADPS4_ASYNC_COMPUTE")) {
+            return v[0] != '0';
+        }
+        return true;
+    }();
+    if (!async_compute_enabled) {
+        return false;
+    }
     if (!compute_queue.IsAvailable() || !pipeline.IsReady()) {
         return false;
     }
@@ -457,12 +478,8 @@ void Rasterizer::RouteComputeDispatch(const ComputePipeline* pipeline) {
         // Resolve the reservation so tagged watches complete: empty submit.
         stream.SetPendingComputeTick(0);
         FlushGraphicsForCompute();
-        const u64 gtick =
-            scheduler.CurrentTick() > 0 ? scheduler.CurrentTick() - 1 : 0;
-        const std::pair<vk::Semaphore, u64> gfx_wait{scheduler.GetWorkSemaphore()->Handle(),
-                                                     gtick};
         compute_queue.Begin();
-        compute_queue.Submit({&gfx_wait, 1});
+        compute_queue.Submit(ComputeSubmitWaits());
         ResetComputeBindings();
         return;
     }
@@ -479,9 +496,7 @@ void Rasterizer::RouteComputeDispatch(const ComputePipeline* pipeline) {
     }
     const auto& cs_program = liverpool->GetCsRegs();
     cb.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
-    const u64 gtick = scheduler.CurrentTick() > 0 ? scheduler.CurrentTick() - 1 : 0;
-    const std::pair<vk::Semaphore, u64> gfx_wait{scheduler.GetWorkSemaphore()->Handle(), gtick};
-    const u64 ctick = compute_queue.Submit({&gfx_wait, 1});
+    const u64 ctick = compute_queue.Submit(ComputeSubmitWaits());
     // Tell graphics consumers overlapping these ranges to wait for this tick.
     // Stream ranges are skipped: stream reuse is fenced by the watch mechanism.
     const VideoCore::Buffer* stream_buf = &stream;
@@ -515,6 +530,17 @@ void Rasterizer::FlushGraphicsForCompute() {
     if (scheduler.WorkSinceSubmit() > 0 || scheduler.HasOpenUpload()) {
         scheduler.Flush();
     }
+}
+
+std::vector<std::pair<vk::Semaphore, u64>> Rasterizer::ComputeSubmitWaits() {
+    std::vector<std::pair<vk::Semaphore, u64>> waits;
+    if (const u64 current = scheduler.CurrentTick(); current > 0) {
+        waits.emplace_back(scheduler.GetWorkSemaphore()->Handle(), current - 1);
+    }
+    if (const auto [sema, tick] = buffer_cache.MemoryFence(); sema && tick != 0) {
+        waits.emplace_back(sema, tick);
+    }
+    return waits;
 }
 
 void Rasterizer::DispatchDirect() {

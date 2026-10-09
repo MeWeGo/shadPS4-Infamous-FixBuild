@@ -536,6 +536,13 @@ void BufferCache::PruneComputeWrites() {
                   [&](const ComputeWrite& write) { return compute_is_free(write.tick); });
 }
 
+std::pair<vk::Semaphore, u64> BufferCache::MemoryFence() const noexcept {
+    if (memory_semaphore.CurrentTick() <= 1) {
+        return {vk::Semaphore{}, 0};
+    }
+    return {memory_semaphore.Handle(), memory_semaphore.CurrentTick() - 1};
+}
+
 void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size) {
     CheckComputeOverlap(device_addr, size);
     DownloadCopies copies;
@@ -919,13 +926,28 @@ void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {
     const u64 signal_tick = memory_semaphore.NextTick();
     const auto signal_sema = memory_semaphore.Handle();
 
+    // Remaps must not yank memory out from under in-flight async compute work.
+    std::vector<vk::Semaphore> wait_semas;
+    std::vector<u64> wait_values;
+    if (compute_fence) {
+        const auto [compute_sema, compute_tick] = compute_fence();
+        if (compute_sema && compute_tick != 0) {
+            wait_semas.push_back(compute_sema);
+            wait_values.push_back(compute_tick);
+        }
+    }
+
     const vk::TimelineSemaphoreSubmitInfo timeline_si = {
+        .waitSemaphoreValueCount = static_cast<u32>(wait_semas.size()),
+        .pWaitSemaphoreValues = wait_values.data(),
         .signalSemaphoreValueCount = 1u,
         .pSignalSemaphoreValues = &signal_tick,
     };
 
     const vk::BindSparseInfo sparse_info = {
         .pNext = &timeline_si,
+        .waitSemaphoreCount = static_cast<u32>(wait_semas.size()),
+        .pWaitSemaphores = wait_semas.data(),
         .bufferBindCount = static_cast<u32>(buffer_binds.size()),
         .pBufferBinds = buffer_binds.data(),
         .signalSemaphoreCount = 1u,

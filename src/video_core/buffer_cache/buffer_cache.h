@@ -120,6 +120,16 @@ public:
     void SetComputeIsFree(std::function<bool(u64)> is_free) {
         compute_is_free = std::move(is_free);
     }
+    /// Provides the async-compute fence (semaphore + last submitted tick) that
+    /// sparse binds must wait for, so remaps don't yank memory out from under
+    /// in-flight compute work. Empty tick means nothing to wait for.
+    void SetComputeFence(std::function<std::pair<vk::Semaphore, u64>()> fence) {
+        compute_fence = std::move(fence);
+    }
+    /// Fence covering all sparse binds submitted so far (semaphore + tick,
+    /// tick 0 when none). Compute submissions wait for it before touching
+    /// arena memory.
+    std::pair<vk::Semaphore, u64> MemoryFence() const noexcept;
 
     /// Finds a buffer for the specified region. is_read_tracked tells that the caller reports
     /// its accesses to the runtime, which lets small reads use the cached copy in place.
@@ -306,6 +316,8 @@ private:
     u64 pending_compute_wait{};
     /// True when a compute-timeline tick is complete. Set once when async compute exists.
     std::function<bool(u64)> compute_is_free{};
+    /// Fence of the async-compute timeline for sparse binds. Set with SetComputeFence.
+    std::function<std::pair<vk::Semaphore, u64>()> compute_fence{};
     /// Marks graphics to wait for compute work overlapping a range. GPU thread.
     void CheckComputeOverlap(VAddr addr, u64 size);
 

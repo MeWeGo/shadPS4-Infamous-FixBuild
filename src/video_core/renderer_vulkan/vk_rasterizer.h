@@ -143,6 +143,9 @@ private:
     /// Submits open graphics work (recorded draws/dispatches or uploads) so an
     /// async compute submission can wait for an already-submitted tick.
     void FlushGraphicsForCompute();
+    /// Waits a compute submission needs: all submitted graphics work plus all
+    /// submitted sparse binds, so it never touches unmapped or stale memory.
+    std::vector<std::pair<vk::Semaphore, u64>> ComputeSubmitWaits();
 
     void BindVertexBuffers(const GraphicsPipeline* pipeline);
     void BindIndexBuffer(u32 index_offset = 0);
