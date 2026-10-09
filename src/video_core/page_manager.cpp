@@ -41,6 +41,10 @@
 
 namespace VideoCore {
 
+/// Deferred protection (PageManager::DeferProtect): page ranges [first, end) whose new
+/// protection the calling thread left to RefreshDeferredProtect. Null when not deferring.
+thread_local std::vector<std::pair<u64, u64>>* t_deferred_protect = nullptr;
+
 struct PageManager::Impl {
     struct PageState {
         u8 num_write_watchers;
@@ -212,8 +216,8 @@ struct PageManager::Impl {
     }
 
     void UpdatePageWatchersForRegion(VAddr base_addr, const Bounds& bounds,
-                                     const RegionBits& write_mask, const RegionBits& read_mask,
-                                     PageOp write_op, PageOp read_op) {
+                                      const RegionBits& write_mask, const RegionBits& read_mask,
+                                      PageOp write_op, PageOp read_op) {
         const u64 base_page = base_addr >> PM_PAGE_BITS;
         const u64 page_start = bounds.start_word * PAGES_PER_WORD + bounds.start_page;
         const u64 page_end = bounds.end_word * PAGES_PER_WORD + bounds.end_page + 1;
@@ -225,7 +229,14 @@ struct PageManager::Impl {
 
         const auto release_pending = [&] {
             if (range_pages > 0) {
-                Protect(range_begin << PM_PAGE_BITS, range_pages << PM_PAGE_BITS, perms);
+                if (t_deferred_protect) {
+                    // The upload worker applies the protection before it copies the pages,
+                    // so a guest write in between is caught by its snapshot, and one after
+                    // faults and re-dirties the page.
+                    t_deferred_protect->emplace_back(range_begin, range_begin + range_pages);
+                } else {
+                    Protect(range_begin << PM_PAGE_BITS, range_pages << PM_PAGE_BITS, perms);
+                }
                 range_pages = 0;
                 potential_pages = 0;
             }
@@ -275,6 +286,46 @@ struct PageManager::Impl {
         release_pending();
 
         UnlockGroups(locked);
+    }
+
+    u64 RefreshDeferredProtect(u64 first_page, u64 end_page) {
+        u64 covered_pages = 0;
+        Core::MemoryPermission perms{};
+        u64 range_begin = first_page;
+        u64 range_pages = 0;
+
+        const auto release_pending = [&] {
+            if (range_pages > 0) {
+                Protect(range_begin << PM_PAGE_BITS, range_pages << PM_PAGE_BITS, perms);
+                covered_pages += range_pages;
+                range_pages = 0;
+            }
+        };
+
+        LockedGroups locked;
+        for (u64 page = first_page; page != end_page; ++page) {
+            const PageState* state = cached_pages.find(page);
+            if (!state) {
+                // No tracked page: end the run rather than protect a page nobody watches.
+                release_pending();
+                continue;
+            }
+            LockGroup(page, locked);
+            const auto page_perms = state->Perms();
+            if (range_pages == 0) {
+                range_begin = page;
+                perms = page_perms;
+            } else if (page_perms != perms) {
+                release_pending();
+                range_begin = page;
+                perms = page_perms;
+            }
+            ++range_pages;
+        }
+        release_pending();
+
+        UnlockGroups(locked);
+        return covered_pages;
     }
 
     struct PageTraits {
@@ -566,6 +617,14 @@ void PageManager::UpdatePageWatchersForRegion(VAddr base_addr, const Bounds& bou
                                               const RegionBits& read_mask, PageOp write_op,
                                               PageOp read_op) const {
     impl->UpdatePageWatchersForRegion(base_addr, bounds, write_mask, read_mask, write_op, read_op);
+}
+
+void PageManager::DeferProtect(std::vector<std::pair<u64, u64>>* deferred_pages) {
+    t_deferred_protect = deferred_pages;
+}
+
+u64 PageManager::RefreshDeferredProtect(u64 first_page, u64 end_page) const {
+    return impl->RefreshDeferredProtect(first_page, end_page);
 }
 
 } // namespace VideoCore

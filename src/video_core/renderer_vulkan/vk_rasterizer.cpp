@@ -63,6 +63,10 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     memory->SetRasterizer(this);
 
     scheduler.SetSubmitCallback([this](Vulkan::SubmitInfo& info) {
+        // The staging the upload worker copies into must be complete before the command
+        // buffers using it reach the driver, and with them every page the uploads
+        // protect.
+        buffer_cache.FlushUploadJobs();
         // Graphics work consuming async-compute results waits for them here, so
         // dispatches routed to the compute queue overlap instead of serializing.
         if (const u64 wait = buffer_cache.ConsumePendingComputeWait()) {

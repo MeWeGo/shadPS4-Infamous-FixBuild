@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 #include <magic_enum/magic_enum.hpp>
 
 #include "common/alignment.h"
@@ -15,6 +16,7 @@
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/memory_tracker.h"
 #include "video_core/buffer_cache/region_definitions.h"
+#include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -60,6 +62,23 @@ std::optional<u32> FindMemoryType(const vk::PhysicalDeviceMemoryProperties& prop
     return std::nullopt;
 }
 
+/// Whether uploads run on the worker thread. SHADPS4_UPLOAD_WORKER=0 turns it off.
+static bool UploadWorkerEnabled() {
+    static const bool enabled = [] {
+        if (const char* v = std::getenv("SHADPS4_UPLOAD_WORKER")) {
+            return v[0] != '0';
+        }
+        return true;
+    }();
+    return enabled;
+}
+
+/// The worker is woken once this many jobs are queued (each wake is a system call for the
+/// command processor); otherwise it looks for jobs every millisecond, and a submission
+/// waiting for jobs does them itself.
+static constexpr size_t UploadWorkerWakeJobs = 8;
+
+
 BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
                          Vulkan::Runtime& runtime_, AmdGpu::Liverpool* liverpool_,
                          TextureCache& texture_cache_, PageManager& tracker)
@@ -100,10 +119,133 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     bda_pagetable_buffer = std::make_unique<Buffer>(
         instance, 0, bda_pagetable_size, MemoryType::DeviceLocal, "BDA Page Table Buffer");
     runtime.FillBuffer(bda_pagetable_buffer.get(), 0u, bda_pagetable_size, 0u);
+    if (UploadWorkerEnabled()) {
+        upload_worker = std::make_unique<UploadWorker>(tracker);
+    } else {
+        LOG_INFO(Render, "Upload worker disabled (SHADPS4_UPLOAD_WORKER=0)");
+    }
     readback_thread = std::jthread{[this](std::stop_token token) { ReadbackThread(token); }};
 }
 
 BufferCache::~BufferCache() = default;
+
+BufferCache::UploadWorker::UploadWorker(PageManager& page_manager_)
+    : page_manager{page_manager_} {
+    thread = std::jthread([this](std::stop_token stoken) { Run(stoken); });
+}
+
+BufferCache::UploadWorker::~UploadWorker() {
+    thread.request_stop();
+    queue_cv.notify_all();
+    if (thread.joinable()) {
+        thread.join();
+    }
+}
+
+void BufferCache::UploadWorker::Enqueue(Job&& job) {
+    bool wake;
+    {
+        std::scoped_lock lock{queue_mutex};
+        queue.push_back(std::move(job));
+        wake = queue.size() >= UploadWorkerWakeJobs;
+    }
+    if (wake) {
+        queue_cv.notify_one();
+    }
+}
+
+bool BufferCache::UploadWorker::Idle() noexcept {
+    std::scoped_lock lock{queue_mutex};
+    return queue.empty();
+}
+
+void BufferCache::UploadWorker::Flush() {
+    // Jobs the worker took are done once it releases exec_mutex: do those still queued.
+    std::scoped_lock exec_lock{exec_mutex};
+    ExecuteQueued();
+}
+
+void BufferCache::UploadWorker::Run(std::stop_token stoken) {
+    Common::SetCurrentThreadName("shadPS4:GpuUploadWorker");
+    while (!stoken.stop_requested()) {
+        {
+            std::unique_lock lock{queue_mutex};
+            queue_cv.wait_for(lock, stoken, std::chrono::milliseconds{1},
+                              [this] { return !queue.empty(); });
+            if (queue.empty()) {
+                continue;
+            }
+        }
+        std::scoped_lock exec_lock{exec_mutex};
+        ExecuteQueued();
+    }
+    // Complete what a shutdown left queued, keeping the tracker and the staging pool
+    // consistent on the way out.
+    std::scoped_lock exec_lock{exec_mutex};
+    ExecuteQueued();
+}
+
+void BufferCache::UploadWorker::ExecuteQueued() {
+    {
+        std::scoped_lock lock{queue_mutex};
+        if (queue.empty()) {
+            return;
+        }
+        batch.swap(queue);
+    }
+    const auto start = std::chrono::steady_clock::now();
+    // First the protections of all the jobs, merged: fewer system calls.
+    ranges.clear();
+    for (const Job& job : batch) {
+        ranges.insert(ranges.end(), job.pages.begin(), job.pages.end());
+    }
+    std::sort(ranges.begin(), ranges.end());
+    u64 num_pages = 0;
+    for (size_t i = 0; i < ranges.size();) {
+        const u64 first = ranges[i].first;
+        u64 end = ranges[i].second;
+        for (++i; i < ranges.size() && ranges[i].first <= end; ++i) {
+            end = std::max(end, ranges[i].second);
+        }
+        num_pages += page_manager.RefreshDeferredProtect(first, end);
+    }
+    // Then the copies: a guest write to these pages faults from now on, and one since
+    // the upload was recorded is caught by the snapshot these take.
+    auto* const guest_memory = Core::Memory::Instance();
+    u64 num_bytes = 0;
+    for (const Job& job : batch) {
+        for (const Copy& copy : job.copies) {
+            guest_memory->CopySparseMemory(copy.src, copy.dst, copy.size);
+            num_bytes += copy.size;
+        }
+        job.staging.Flush();
+    }
+    stat_jobs += batch.size();
+    stat_bytes += num_bytes;
+    stat_pages += num_pages;
+    batch.clear();
+    const auto now = std::chrono::steady_clock::now();
+    stat_busy_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count();
+    if (now - last_report >= std::chrono::seconds{10}) {
+        const double busy_pct =
+            stat_busy_ns * 100.0 / std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                    now - std::exchange(last_report, now))
+                                          .count();
+        LOG_INFO(Render,
+                 "Upload worker: {} jobs ({} MB copied, {} pages protected), busy {:.0f}%",
+                 stat_jobs, stat_bytes >> 20, stat_pages, busy_pct);
+        stat_jobs = 0;
+        stat_bytes = 0;
+        stat_pages = 0;
+        stat_busy_ns = 0;
+    }
+}
+
+void BufferCache::FlushUploadJobs() {
+    if (upload_worker) {
+        upload_worker->Flush();
+    }
+}
 
 void BufferCache::TickFrame() {
     if (std::exchange(fault_process_pending, false)) {
@@ -836,22 +978,59 @@ std::pair<vk::DeviceMemory, u64> BufferCache::AllocateResidency(u64 size) {
 bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size,
                                     bool is_written, bool is_texel_buffer) {
     CheckComputeOverlap(device_addr, size);
+    // The upload worker takes the read-only uploads. It applies the page protection of
+    // what it uploads before copying: a guest write meanwhile is caught by its snapshot,
+    // one after it faults and re-dirties the page.
+    const bool async_upload = upload_worker && !is_written && !is_texel_buffer;
+    if (async_upload) {
+        deferred_pages.clear();
+        PageManager::DeferProtect(&deferred_pages);
+    }
     boost::container::small_vector<vk::BufferCopy, 4> copies;
     size_t total_size_bytes{};
     memory_tracker->ForEachUploadRange(device_addr, size, is_written, [&](u64 addr, u64 size) {
         copies.emplace_back(total_size_bytes, addr, size);
         total_size_bytes += size;
     });
+    if (async_upload) {
+        PageManager::DeferProtect(nullptr);
+    }
     if (!copies.empty()) {
         Common::Perf::ScopedStall stall{Common::Perf::Stall::BufferUpload, total_size_bytes};
         const auto staging = staging_pool.Request(total_size_bytes, MemoryType::HostUncached);
-        for (auto& copy : copies) {
-            memory->CopySparseMemory(copy.dstOffset, staging.mapped + copy.srcOffset, copy.size);
-            copy.srcOffset += staging.offset;
-            copy.dstOffset -= arena->cpu_addr;
+        if (async_upload) {
+            UploadWorker::Job job;
+            job.pages = std::move(deferred_pages);
+            job.copies.reserve(copies.size());
+            for (auto& copy : copies) {
+                job.copies.push_back(UploadWorker::Copy{
+                    .src = copy.dstOffset,
+                    .dst = staging.mapped + copy.srcOffset,
+                    .size = copy.size,
+                });
+                copy.srcOffset += staging.offset;
+                copy.dstOffset -= arena->cpu_addr;
+            }
+            job.staging = staging;
+            job.bytes = total_size_bytes;
+            runtime.UploadBuffer(staging.buffer, arena, copies);
+            upload_worker->Enqueue(std::move(job));
+        } else {
+            for (auto& copy : copies) {
+                memory->CopySparseMemory(copy.dstOffset, staging.mapped + copy.srcOffset,
+                                         copy.size);
+                copy.srcOffset += staging.offset;
+                copy.dstOffset -= arena->cpu_addr;
+            }
+            staging.Flush();
+            runtime.UploadBuffer(staging.buffer, arena, copies);
         }
-        staging.Flush();
-        runtime.UploadBuffer(staging.buffer, arena, copies);
+    } else if (async_upload && !deferred_pages.empty()) {
+        // Protection deferred for a range with nothing to upload: complete it on the
+        // worker like the rest.
+        UploadWorker::Job job;
+        job.pages = std::move(deferred_pages);
+        upload_worker->Enqueue(std::move(job));
     }
     if (is_texel_buffer && !is_written) {
         return SynchronizeMemoryFromImage(arena, device_addr, size);

@@ -91,6 +91,11 @@ public:
 
     void TickFrame();
 
+    /// Waits for the upload worker to finish every job, finishing the ones it left.
+    /// A submission calls this first: the staging the jobs copy into must be complete
+    /// before the command buffer using it reaches the driver.
+    void FlushUploadJobs();
+
     /// Copies back GPU modified memory that game threads read back recently, before they read
     /// it again. Called when the game is signalled that GPU work is done.
     void PrefetchReadbacks();
@@ -371,6 +376,71 @@ private:
     std::condition_variable_any finished_readbacks_cv;
     /// Declared last so it stops before anything it uses goes away.
     std::jthread readback_thread;
+
+    /// Copies guest memory into staging and applies the page protections of the uploads
+    /// on a thread of its own, off the command processor. A submission flushes every job
+    /// first: the staging a job copies into must be complete before the command buffer
+    /// using it is submitted, which is before the GPU reads it.
+    class UploadWorker {
+    public:
+        explicit UploadWorker(PageManager& page_manager_);
+        ~UploadWorker();
+
+        UploadWorker(const UploadWorker&) = delete;
+        UploadWorker& operator=(const UploadWorker&) = delete;
+
+        struct Copy {
+            /// Guest address to read.
+            VAddr src;
+            /// Host mapping to write.
+            u8* dst;
+            u64 size;
+        };
+        struct Job {
+            /// Page ranges [first_page, end_page) whose protection to apply first, so a
+            /// guest write after it faults and one before is caught by the copies.
+            std::vector<std::pair<u64, u64>> pages;
+            boost::container::small_vector<Copy, 8> copies;
+            Vulkan::StagingBufferRef staging;
+            u64 bytes{};
+        };
+
+        /// Queues a job. Single producer: the command processor thread.
+        void Enqueue(Job&& job);
+
+        /// Completes every queued job: waits for the ones the worker took, finishing
+        /// what it left in the queue.
+        void Flush();
+
+        [[nodiscard]] bool Idle() noexcept;
+
+    private:
+        void Run(std::stop_token stoken);
+        void ExecuteQueued();
+
+        PageManager& page_manager;
+        std::jthread thread;
+        std::mutex queue_mutex;
+        std::condition_variable_any queue_cv;
+        std::vector<Job> queue;
+        /// Held while the worker executes: Flush waits on it, so a job is either
+        /// queued, executing or done, never lost in between.
+        std::mutex exec_mutex;
+        std::vector<Job> batch;
+        std::vector<std::pair<u64, u64>> ranges;
+        std::chrono::steady_clock::time_point last_report{};
+        u64 stat_jobs{};
+        u64 stat_bytes{};
+        u64 stat_pages{};
+        u64 stat_busy_ns{};
+    };
+
+    /// Null when the upload worker is off (SHADPS4_UPLOAD_WORKER=0).
+    std::unique_ptr<UploadWorker> upload_worker;
+    /// Page ranges whose protection the upload being prepared defers to the worker.
+    /// Command processor thread only.
+    std::vector<std::pair<u64, u64>> deferred_pages;
+    /// Declared after the staging pool and the tracker so it stops before they go away.
 };
 
 } // namespace VideoCore
