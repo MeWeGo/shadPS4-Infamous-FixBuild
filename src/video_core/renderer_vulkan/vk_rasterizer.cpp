@@ -430,16 +430,17 @@ void Rasterizer::BindComputePipeline(const ComputePipeline& pipeline) {
 
 namespace {
 
-// Bisection for async compute, read once, no settings churn:
-// 0 = everything on the graphics queue, 1 = full routing (default),
-// 2 = submit empty compute work (no record), 3 = bind pipeline only,
-// 4 = bind + push constants + descriptors (no dispatch).
+// Async compute routing. Read once, no settings churn:
+// 0 = everything on the graphics queue (default: the per-dispatch submission
+//     design serializes on all prior graphics work anyway, giving no overlap
+//     for its deadlock risk), 1 = full routing, 2 = empty submits, 3 = bind
+//     only, 4 = bind + push + descriptors.
 int AsyncComputeMode() {
     static const int mode = [] {
         if (const char* v = std::getenv("SHADPS4_ASYNC_COMPUTE")) {
             return std::atoi(v);
         }
-        return 1;
+        return 0;
     }();
     return mode;
 }
