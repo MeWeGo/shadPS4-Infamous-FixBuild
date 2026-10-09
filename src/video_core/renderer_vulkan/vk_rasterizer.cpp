@@ -89,6 +89,9 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     });
     buffer_cache.SetComputeIsFree(
         [this](u64 tick) { return compute_queue.IsFree(tick); });
+    // The second queue doubles as the readback queue: copies of GPU modified
+    // memory wait for the submission that wrote it, not the whole timeline.
+    buffer_cache.SetReadbackQueue(&compute_queue);
     buffer_cache.SetComputeFence([this]() -> std::pair<vk::Semaphore, u64> {
         if (!compute_queue.IsAvailable()) {
             return {vk::Semaphore{}, 0};
@@ -700,7 +703,14 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
         if (!last_work_compute) {
             Common::Perf::Count(Common::Perf::Counter::SwitchBarriers);
         }
-        runtime.FlushBarriers();
+        // Indirect dispatches read their args in the draw indirect stage (part of
+        // all graphics) and run compute: a draw reading the same memory later
+        // issues its own barrier with a graphics destination.
+        runtime.FlushBarriers(vk::PipelineStageFlagBits2::eComputeShader |
+                                  vk::PipelineStageFlagBits2::eDrawIndirect,
+                              vk::AccessFlagBits2::eShaderRead |
+                                  vk::AccessFlagBits2::eShaderWrite |
+                                  vk::AccessFlagBits2::eIndirectCommandRead);
     }
 
     scheduler.EndRendering();
@@ -928,6 +938,11 @@ void Rasterizer::ResetBindings(bool is_compute) {
             is_written ? vk::AccessFlagBits2::eShaderWrite : vk::AccessFlagBits2::eNone;
         runtime.AccessBuffer(buffer, offset, size, dst_stage,
                              vk::AccessFlagBits2::eShaderRead | write_flag);
+        if (is_written) {
+            // The submission being recorded wrote to GPU memory: a readback of it
+            // waits for this tick, not for the latest one.
+            buffer_cache.NoteGpuWriteTick();
+        }
     }
     if (std::exchange(untracked_access, false)) {
         runtime.NoteUntrackedAccess();

@@ -34,6 +34,7 @@ class MemoryManager;
 }
 
 namespace Vulkan {
+class ComputeQueue;
 class GraphicsPipeline;
 struct SubmitInfo;
 class Runtime;
@@ -95,6 +96,16 @@ public:
     /// A submission calls this first: the staging the jobs copy into must be complete
     /// before the command buffer using it reaches the driver.
     void FlushUploadJobs();
+
+    /// Gives the buffer cache a second Vulkan queue to run readback copies on,
+    /// so a game thread waiting for its data waits only for the submission that
+    /// wrote it (signalled on that queue's timeline), not for the whole graphics
+    /// timeline up to the submission the copy was recorded in.
+    void SetReadbackQueue(Vulkan::ComputeQueue* queue) noexcept;
+
+    /// Notes the tick of the submission that last wrote to a buffer the GPU
+    /// bound. The readback copy waits for this tick, not for the latest one.
+    void NoteGpuWriteTick() noexcept;
 
     /// Copies back GPU modified memory that game threads read back recently, before they read
     /// it again. Called when the game is signalled that GPU work is done.
@@ -171,6 +182,9 @@ private:
         VAddr start{};
         VAddr end{};
         u64 tick{};
+        /// True when the copy runs on the readback queue and the tick is on its
+        /// timeline; false for the graphics queue's timeline.
+        bool on_readback_queue{};
         /// Set by the GPU thread when it writes the memory again, so the copy is outdated.
         std::atomic<bool> stale{};
         std::atomic<bool> applied{};
@@ -250,7 +264,8 @@ private:
 
     /// Records a copy back of the GPU modified memory in a window, or returns null if there is
     /// none. GPU thread.
-    std::shared_ptr<Readback> RecordReadback(const Buffer* arena, VAddr start, VAddr end);
+    std::shared_ptr<Readback> RecordReadback(const Buffer* arena, VAddr start, VAddr end,
+                                             bool record_copy = true);
 
     /// Takes the GPU modified ranges in a range out of the tracked ones, adding copies of them.
     u64 CollectDownloads(const Buffer* arena, VAddr device_addr, u64 size, DownloadCopies& copies);
@@ -440,6 +455,11 @@ private:
     /// Page ranges whose protection the upload being prepared defers to the worker.
     /// Command processor thread only.
     std::vector<std::pair<u64, u64>> deferred_pages;
+    /// Second queue for readback copies, set by the rasterizer. Null disables it.
+    Vulkan::ComputeQueue* readback_queue{};
+    /// Tick of the submission that last wrote to a GPU-bound buffer, so the readback
+    /// copy waits for it rather than for the latest submission. GPU thread only.
+    u64 last_write_tick{};
     /// Declared after the staging pool and the tracker so it stops before they go away.
 };
 

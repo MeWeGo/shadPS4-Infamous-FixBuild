@@ -17,6 +17,7 @@
 #include "video_core/buffer_cache/memory_tracker.h"
 #include "video_core/buffer_cache/region_definitions.h"
 #include "video_core/page_manager.h"
+#include "video_core/renderer_vulkan/vk_compute_queue.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -247,6 +248,14 @@ void BufferCache::FlushUploadJobs() {
     }
 }
 
+void BufferCache::SetReadbackQueue(Vulkan::ComputeQueue* queue) noexcept {
+    readback_queue = queue;
+}
+
+void BufferCache::NoteGpuWriteTick() noexcept {
+    last_write_tick = scheduler.CurrentTick();
+}
+
 void BufferCache::TickFrame() {
     if (std::exchange(fault_process_pending, false)) {
         fault_manager->ProcessFaultBuffer();
@@ -371,17 +380,64 @@ std::shared_ptr<BufferCache::Readback> BufferCache::StartReadback(VAddr device_a
         }
     }
 
-    auto readback = RecordReadback(arena, window_start, window_end);
+    // The readback copy can run on the second queue, waiting only for the submission
+    // that wrote the data (tracked by NoteGpuWriteTick) rather than for the whole
+    // graphics timeline up to the submission the copy would have been recorded in.
+    // The data must be from an already submitted command buffer: a write in the one
+    // being recorded has a tick that isn't signalled yet, and waiting for it on
+    // another queue would deadlock (the recording thread would have to flush first).
+    const bool use_queue = readback_queue != nullptr && last_write_tick > 0 &&
+                           last_write_tick < scheduler.CurrentTick();
+    auto readback = RecordReadback(arena, window_start, window_end, !use_queue);
     if (!readback) {
         return nullptr;
     }
     ++readback_stats.on_fault;
-    scheduler.Flush();
+
+    if (use_queue) {
+        // The copies were already offset for the staging buffer by RecordReadback.
+        const vk::CommandBuffer cb = readback_queue->Begin();
+        for (const auto& copy : readback->copies) {
+            const vk::BufferCopy queue_copy = {
+                .srcOffset = copy.srcOffset,
+                .dstOffset = copy.dstOffset,
+                .size = copy.size,
+            };
+            cb.copyBuffer(arena->Handle(), readback->staging.buffer->Handle(), queue_copy);
+        }
+        // Make the copied data visible to host reads.
+        const vk::MemoryBarrier2 to_host = {
+            .srcStageMask = vk::PipelineStageFlagBits2::eCopy,
+            .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+            .dstAccessMask = vk::AccessFlagBits2::eHostRead,
+        };
+        cb.pipelineBarrier2(vk::DependencyInfo{
+            .memoryBarrierCount = 1,
+            .pMemoryBarriers = &to_host,
+        });
+        const std::pair<vk::Semaphore, u64> gfx_wait{scheduler.GetWorkSemaphore()->Handle(),
+                                                     last_write_tick};
+        readback->tick = readback_queue->Submit({&gfx_wait, 1});
+        readback->on_readback_queue = true;
+        // The graphics queue's command buffer doesn't carry the copy: it can keep
+        // recording. But the arena's pages were taken out of the GPU modified ones
+        // by CollectDownloads, so nothing else downloads them until this is done.
+        // Flush the graphics queue so it isn't holding work the game thread's
+        // unblocking depends on (the readback only waits for an earlier tick, but
+        // the game might need the graphics results of this submission too).
+        scheduler.Flush();
+    } else {
+        // The data was written by the current command buffer, or no second queue:
+        // RecordReadback already recorded the copy on the graphics command buffer.
+        scheduler.Flush();
+    }
     return readback;
 }
 
 std::shared_ptr<BufferCache::Readback> BufferCache::RecordReadback(const Buffer* arena, VAddr start,
-                                                                   VAddr end) {
+                                                                   VAddr end,
+                                                                   bool record_copy) {
     auto readback = std::make_shared<Readback>();
     readback->arena_base = arena->cpu_addr;
     readback->start = start;
@@ -396,8 +452,11 @@ std::shared_ptr<BufferCache::Readback> BufferCache::RecordReadback(const Buffer*
     for (auto& copy : readback->copies) {
         copy.dstOffset += readback->staging.offset;
     }
-    runtime.CopyBuffer(arena, readback->staging.buffer, readback->copies);
-    readback->tick = scheduler.CurrentTick();
+    if (record_copy) {
+        runtime.CopyBuffer(arena, readback->staging.buffer, readback->copies);
+        readback->tick = scheduler.CurrentTick();
+    }
+    // With record_copy=false, the caller records the copy and sets the tick.
     readbacks.push_back(readback);
     return readback;
 }
@@ -526,7 +585,14 @@ void BufferCache::ReadbackThread(std::stop_token token) {
 bool BufferCache::FinishReadback(Readback& readback, bool ahead) {
     if (!ahead) {
         Common::Perf::ScopedStall stall{Common::Perf::Stall::ReadbackWait};
-        scheduler.GetWorkSemaphore()->Wait(readback.tick);
+        if (readback.on_readback_queue && readback_queue) {
+            // The copy runs on the readback queue: waiting for its tick is waiting
+            // only for the submission that wrote the data and the copy after it,
+            // not for the whole graphics timeline.
+            readback_queue->Wait(readback.tick);
+        } else {
+            scheduler.GetWorkSemaphore()->Wait(readback.tick);
+        }
     }
     std::scoped_lock lock{readback.mutex};
     if (readback.applied) {
