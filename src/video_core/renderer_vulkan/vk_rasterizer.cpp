@@ -425,16 +425,30 @@ void Rasterizer::BindComputePipeline(const ComputePipeline& pipeline) {
     }
 }
 
-bool Rasterizer::IsAsyncComputeEligible(const ComputePipeline& pipeline, const Shader::Info& cs) {
-    // Kill switch for bisection: SHADPS4_ASYNC_COMPUTE=0 keeps everything on
-    // the graphics queue. Read once; no settings churn.
-    static const bool async_compute_enabled = [] {
+namespace {
+
+// Bisection for async compute, read once, no settings churn:
+// 0 = everything on the graphics queue, 1 = full routing (default),
+// 2 = submit empty compute work (no record), 3 = bind pipeline only,
+// 4 = bind + push constants + descriptors (no dispatch).
+int AsyncComputeMode() {
+    static const int mode = [] {
         if (const char* v = std::getenv("SHADPS4_ASYNC_COMPUTE")) {
-            return v[0] != '0';
+            return std::atoi(v);
         }
-        return true;
+        return 1;
     }();
-    if (!async_compute_enabled) {
+    return mode;
+}
+
+} // namespace
+
+bool Rasterizer::IsAsyncComputeEligible(const ComputePipeline& pipeline, const Shader::Info& cs) {
+    // Kill switch / bisection for async compute, read once, no settings churn:
+    // 0 = everything on the graphics queue, 1 = full routing (default),
+    // 2 = submit empty compute work (no record), 3 = bind pipeline only,
+    // 4 = bind + push constants + descriptors (no dispatch).
+    if (AsyncComputeMode() <= 0) {
         return false;
     }
     if (!compute_queue.IsAvailable() || !pipeline.IsReady()) {
@@ -486,16 +500,23 @@ void Rasterizer::RouteComputeDispatch(const ComputePipeline* pipeline) {
     // Hand open graphics work (e.g. uploads recorded above) to the GPU first so
     // the compute submission below can wait for an already-submitted tick.
     FlushGraphicsForCompute();
+    const int ac_mode = AsyncComputeMode();
     vk::CommandBuffer cb = compute_queue.Begin();
-    cb.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
-    cb.pushConstants(pipeline->GetLayout(), vk::ShaderStageFlagBits::eCompute, 0u,
-                     sizeof(push_data), &push_data);
-    if (!set_writes.empty()) {
-        cb.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, pipeline->GetLayout(), 0u,
-                                set_writes);
+    if (ac_mode == 1 || ac_mode >= 3) {
+        cb.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
     }
-    const auto& cs_program = liverpool->GetCsRegs();
-    cb.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
+    if (ac_mode == 1 || ac_mode >= 4) {
+        cb.pushConstants(pipeline->GetLayout(), vk::ShaderStageFlagBits::eCompute, 0u,
+                         sizeof(push_data), &push_data);
+        if (!set_writes.empty()) {
+            cb.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, pipeline->GetLayout(), 0u,
+                                    set_writes);
+        }
+    }
+    if (ac_mode == 1) {
+        const auto& cs_program = liverpool->GetCsRegs();
+        cb.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
+    }
     const u64 ctick = compute_queue.Submit(ComputeSubmitWaits());
     // Tell graphics consumers overlapping these ranges to wait for this tick.
     // Stream ranges are skipped: stream reuse is fenced by the watch mechanism.
