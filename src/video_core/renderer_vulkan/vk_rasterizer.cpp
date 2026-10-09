@@ -67,6 +67,7 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
         // dispatches routed to the compute queue overlap instead of serializing.
         if (const u64 wait = buffer_cache.ConsumePendingComputeWait()) {
             info.AddWait(compute_queue.GetSemaphore().Handle(), wait);
+            LOG_INFO(Render_Vulkan, "Graphics submit waits compute tick {}", wait);
         }
         runtime.FlushBarriers();
         buffer_cache.SubmitPendingArenaBinds(info);
@@ -78,6 +79,7 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
         if (!allow_wait) {
             return false;
         }
+        LOG_INFO(Render_Vulkan, "Stream wrap waits compute tick {}", tick);
         compute_queue.Wait(tick);
         return true;
     });

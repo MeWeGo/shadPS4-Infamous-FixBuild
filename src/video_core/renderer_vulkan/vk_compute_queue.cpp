@@ -3,7 +3,10 @@
 
 #include "video_core/renderer_vulkan/vk_compute_queue.h"
 
+#include <atomic>
+
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 
 namespace Vulkan {
@@ -81,6 +84,13 @@ u64 ComputeQueue::Submit(std::span<const std::pair<vk::Semaphore, u64>> waits) {
     current = vk::CommandBuffer{};
     last_tick = signal_value;
     reserved_tick = 0;
+    {
+        static std::atomic<u64> submit_count{0};
+        const u64 n = submit_count.fetch_add(1, std::memory_order_relaxed);
+        if (n < 10 || n % 1000 == 0) {
+            LOG_INFO(Render_Vulkan, "Compute submit #{} signalled tick {}", n, signal_value);
+        }
+    }
     return signal_value;
 }
 
