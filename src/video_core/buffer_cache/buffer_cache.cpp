@@ -508,15 +508,18 @@ void BufferCache::NoteComputeWrites(VAddr start, VAddr end, u64 tick) {
     if (start >= end || tick == 0) {
         return;
     }
+    std::scoped_lock lock{compute_writes_mutex};
     PruneComputeWrites();
     compute_writes.push_back({start, end, tick});
 }
 
-u64 BufferCache::ConsumePendingComputeWait() noexcept {
+u64 BufferCache::ConsumePendingComputeWait() {
+    std::scoped_lock lock{compute_writes_mutex};
     return std::exchange(pending_compute_wait, 0);
 }
 
 void BufferCache::CheckComputeOverlap(VAddr addr, u64 size) {
+    std::scoped_lock lock{compute_writes_mutex};
     if (compute_writes.empty() || size == 0) {
         return;
     }

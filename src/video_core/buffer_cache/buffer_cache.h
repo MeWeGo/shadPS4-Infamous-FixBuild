@@ -115,7 +115,7 @@ public:
     /// Notes ranges an async compute submission wrote. Prunes completed ticks.
     void NoteComputeWrites(VAddr start, VAddr end, u64 tick);
     /// Returns and clears the compute tick graphics must wait for, 0 if none.
-    u64 ConsumePendingComputeWait() noexcept;
+    u64 ConsumePendingComputeWait();
     /// Tells whether an async-compute timeline tick completed, for pruning.
     void SetComputeIsFree(std::function<bool(u64)> is_free) {
         compute_is_free = std::move(is_free);
@@ -314,6 +314,11 @@ private:
     std::vector<ComputeWrite> compute_writes;
     /// Latest compute tick graphics was told to wait for, consumed at submit.
     u64 pending_compute_wait{};
+    /// Guards compute_writes and pending_compute_wait: the submit callback
+    /// also runs on the presenter thread, while notes/checks run on the GPU
+    /// thread. An untorn tick is load-bearing here: a garbage tick waits
+    /// forever, so this must never race.
+    std::mutex compute_writes_mutex;
     /// True when a compute-timeline tick is complete. Set once when async compute exists.
     std::function<bool(u64)> compute_is_free{};
     /// Fence of the async-compute timeline for sparse binds. Set with SetComputeFence.
