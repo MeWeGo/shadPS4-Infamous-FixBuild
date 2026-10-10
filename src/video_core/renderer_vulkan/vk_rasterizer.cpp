@@ -463,14 +463,17 @@ void Rasterizer::BindComputePipeline(const ComputePipeline& pipeline) {
 namespace {
 
 // Async compute routing, v2: batched. Read once, no settings churn:
-// 0 = everything on the graphics queue, 1 = batched compute rings (default),
-// 9 = per-dispatch (the failed v1, kept for triage only).
+// 0 = everything on the graphics queue (default: the batch cannot see uploads
+//     recorded after it opened, and a compute shader reading stale arena data
+//     can hang the GPU — the game syncs its compute and graphics rings
+//     explicitly on PS4, which the emulator doesn't model yet), 1 = batched
+//     compute rings, 9 = per-dispatch (the failed v1, for triage only).
 int AsyncComputeMode() {
     static const int mode = [] {
         if (const char* v = std::getenv("SHADPS4_ASYNC_COMPUTE")) {
             return std::atoi(v);
         }
-        return 1;
+        return 0;
     }();
     return mode;
 }
