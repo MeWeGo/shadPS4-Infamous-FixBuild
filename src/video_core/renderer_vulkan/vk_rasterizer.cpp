@@ -86,7 +86,12 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
         if (!allow_wait) {
             return false;
         }
-        LOG_INFO(Render_Vulkan, "Stream wrap waits compute tick {}", tick);
+        // The tick this watch was tagged with is the one the open batch will
+        // signal: submit it, or waiting for the tick deadlocks (nothing signals
+        // it until the batch reaches the compute queue).
+        if (compute_batch_cb) {
+            SubmitComputeBatch();
+        }
         compute_queue.Wait(tick);
         return true;
     });
@@ -102,8 +107,11 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
         if (!compute_queue.IsAvailable()) {
             return {vk::Semaphore{}, 0};
         }
-        // Last submitted compute tick; 0/... CurrentTick()-1 is always signalled
-        // or about to be by the single submitter.
+        // The open batch's dispatches reference memory a sparse bind may remap:
+        // submit it, so the bind waits for a tick that is actually signalled.
+        if (compute_batch_cb) {
+            SubmitComputeBatch();
+        }
         const u64 tick = compute_queue.CurrentTick();
         return {compute_queue.GetSemaphore().Handle(), tick > 0 ? tick - 1 : 0};
     });
