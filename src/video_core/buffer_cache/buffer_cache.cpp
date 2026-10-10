@@ -254,6 +254,12 @@ void BufferCache::SetReadbackQueue(Vulkan::ComputeQueue* queue) noexcept {
 
 void BufferCache::NoteGpuWriteTick() noexcept {
     last_write_tick = scheduler.CurrentTick();
+    last_write_on_compute = false;
+}
+
+void BufferCache::NoteComputeWriteTick(u64 tick) noexcept {
+    last_write_tick = tick;
+    last_write_on_compute = true;
 }
 
 void BufferCache::TickFrame() {
@@ -380,14 +386,24 @@ std::shared_ptr<BufferCache::Readback> BufferCache::StartReadback(VAddr device_a
         }
     }
 
+    // The compute batch's writes aren't in the compute queue until it is
+    // submitted: flush it so the readback copy (on the same queue) can see
+    // them, and so the game thread doesn't wait for a tick nothing signals.
+    if (compute_batch_flusher) {
+        compute_batch_flusher();
+    }
+
     // The readback copy can run on the second queue, waiting only for the submission
-    // that wrote the data (tracked by NoteGpuWriteTick) rather than for the whole
-    // graphics timeline up to the submission the copy would have been recorded in.
-    // The data must be from an already submitted command buffer: a write in the one
-    // being recorded has a tick that isn't signalled yet, and waiting for it on
-    // another queue would deadlock (the recording thread would have to flush first).
+    // that wrote the data (tracked by NoteGpuWriteTick / NoteComputeWriteTick)
+    // rather than for the whole graphics timeline up to the submission the copy
+    // would have been recorded in. A write in the command buffer being recorded
+    // has a tick that isn't signalled yet: waiting for it on another queue would
+    // deadlock, so those fall back to the graphics timeline. A write on the
+    // compute queue is always from a submitted batch (the flusher above): the
+    // copy on the same queue executes after it in order.
     const bool use_queue = readback_queue != nullptr && last_write_tick > 0 &&
-                           last_write_tick < scheduler.CurrentTick();
+                           (last_write_on_compute ||
+                            last_write_tick < scheduler.CurrentTick());
     auto readback = RecordReadback(arena, window_start, window_end, !use_queue);
     if (!readback) {
         return nullptr;
@@ -416,9 +432,16 @@ std::shared_ptr<BufferCache::Readback> BufferCache::StartReadback(VAddr device_a
             .memoryBarrierCount = 1,
             .pMemoryBarriers = &to_host,
         });
-        const std::pair<vk::Semaphore, u64> gfx_wait{scheduler.GetWorkSemaphore()->Handle(),
-                                                     last_write_tick};
-        readback->tick = readback_queue->Submit({&gfx_wait, 1});
+        if (last_write_on_compute) {
+            // The write went to the compute queue: the copy on the same queue
+            // executes after it in order (the queue chains its submissions).
+            // No graphics wait: last_write_tick is on the compute timeline.
+            readback->tick = readback_queue->Submit({});
+        } else {
+            const std::pair<vk::Semaphore, u64> gfx_wait{
+                scheduler.GetWorkSemaphore()->Handle(), last_write_tick};
+            readback->tick = readback_queue->Submit({&gfx_wait, 1});
+        }
         readback->on_readback_queue = true;
         // The graphics queue's command buffer doesn't carry the copy: it can keep
         // recording. But the arena's pages were taken out of the GPU modified ones

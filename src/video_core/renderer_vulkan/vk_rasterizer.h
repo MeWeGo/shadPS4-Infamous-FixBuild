@@ -134,9 +134,13 @@ private:
     /// and no special buffers outside stream-backed ones.
     bool IsAsyncComputeEligible(const ComputePipeline& pipeline, const Shader::Info& cs);
     /// Records a dispatch on the async compute queue instead of the primary
-    /// command buffer. All hazards are handled through compute-timeline waits:
-    /// stream reuse (watches), graphics consumers (pending waits at submit).
+    /// command buffer. Batched: collected in one command buffer through the
+    /// frame, submitted at its end or when a readback needs the results.
     void RouteComputeDispatch(const ComputePipeline* pipeline);
+    /// Submits the open compute batch, noting its writes. Called from the
+    /// submit callback (frame end) and from the readback path (game thread
+    /// faulting on batch-written memory needs the batch submitted first).
+    void SubmitComputeBatch();
     /// Clears bindings after a routed dispatch without touching the runtime
     /// barrier tracking (visibility comes from timeline waits instead).
     void ResetComputeBindings();
@@ -162,9 +166,22 @@ private:
         const Instance& instance;
     Scheduler& scheduler;
     Runtime& runtime;
-    /// Second queue for compute work. Nothing is routed to it yet; it only
-    /// validates queue creation until the async-compute routing lands.
-    ComputeQueue compute_queue;    VideoCore::PageManager page_manager;
+    /// Second queue for compute work. Batched: compute-ring dispatches are
+    /// collected in one command buffer through the frame and submitted at the
+    /// frame's submit, overlapping with the next frame's draws.
+    ComputeQueue compute_queue;
+    /// Command buffer of the open compute batch; null when none.
+    vk::CommandBuffer compute_batch_cb{};
+    /// Graphics tick the batch waits for when submitted: the last submitted one
+    /// when the batch began, so it doesn't wait for work recorded after it.
+    u64 compute_batch_graphics_tick{};
+    /// Guest ranges the batch writes, noted for graphics consumers and the
+    /// readback queue once the batch is submitted and its tick is known.
+    struct ComputeBatchWrite {
+        VAddr start;
+        VAddr end;
+    };
+    boost::container::small_vector<ComputeBatchWrite, 64> compute_batch_writes;    VideoCore::PageManager page_manager;
     VideoCore::BufferCache buffer_cache;
     VideoCore::TextureCache texture_cache;
     AmdGpu::Liverpool* liverpool;

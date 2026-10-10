@@ -67,11 +67,14 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
         // buffers using it reach the driver, and with them every page the uploads
         // protect.
         buffer_cache.FlushUploadJobs();
+        // Submit the compute batch before the graphics submit: the graphics work
+        // consuming its results waits for its tick below, and the batch overlaps
+        // with the graphics work after this submission.
+        SubmitComputeBatch();
         // Graphics work consuming async-compute results waits for them here, so
         // dispatches routed to the compute queue overlap instead of serializing.
         if (const u64 wait = buffer_cache.ConsumePendingComputeWait()) {
             info.AddWait(compute_queue.GetSemaphore().Handle(), wait);
-            LOG_INFO(Render_Vulkan, "Graphics submit waits compute tick {}", wait);
         }
         runtime.FlushBarriers();
         buffer_cache.SubmitPendingArenaBinds(info);
@@ -92,6 +95,9 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     // The second queue doubles as the readback queue: copies of GPU modified
     // memory wait for the submission that wrote it, not the whole timeline.
     buffer_cache.SetReadbackQueue(&compute_queue);
+    // A readback of memory the compute batch writes needs the batch submitted
+    // first: its results aren't in the queue until then.
+    buffer_cache.SetComputeBatchFlusher([this]() { SubmitComputeBatch(); });
     buffer_cache.SetComputeFence([this]() -> std::pair<vk::Semaphore, u64> {
         if (!compute_queue.IsAvailable()) {
             return {vk::Semaphore{}, 0};
@@ -448,17 +454,15 @@ void Rasterizer::BindComputePipeline(const ComputePipeline& pipeline) {
 
 namespace {
 
-// Async compute routing. Read once, no settings churn:
-// 0 = everything on the graphics queue (default: the per-dispatch submission
-//     design serializes on all prior graphics work anyway, giving no overlap
-//     for its deadlock risk), 1 = full routing, 2 = empty submits, 3 = bind
-//     only, 4 = bind + push + descriptors.
+// Async compute routing, v2: batched. Read once, no settings churn:
+// 0 = everything on the graphics queue, 1 = batched compute rings (default),
+// 9 = per-dispatch (the failed v1, kept for triage only).
 int AsyncComputeMode() {
     static const int mode = [] {
         if (const char* v = std::getenv("SHADPS4_ASYNC_COMPUTE")) {
             return std::atoi(v);
         }
-        return 0;
+        return 1;
     }();
     return mode;
 }
@@ -466,29 +470,31 @@ int AsyncComputeMode() {
 } // namespace
 
 bool Rasterizer::IsAsyncComputeEligible(const ComputePipeline& pipeline, const Shader::Info& cs) {
-    // Kill switch / bisection for async compute, read once, no settings churn:
-    // 0 = everything on the graphics queue, 1 = full routing (default),
-    // 2 = submit empty compute work (no record), 3 = bind pipeline only,
-    // 4 = bind + push constants + descriptors (no dispatch).
     if (AsyncComputeMode() <= 0) {
         return false;
     }
     if (!compute_queue.IsAvailable() || !pipeline.IsReady()) {
         return false;
     }
-    // Compute-ring work needs multi-timeline readbacks, indirect dispatches need
-    // producer ordering with their arg buffers: both stay on the graphics queue.
-    if (liverpool->IsComputeRingActive()) {
-        return false;
+    // v2 routes the game's compute rings: on PS4 they run beside the graphics
+    // ring and their results are consumed by the next frame's draws or by the
+    // game reading them back. Graphics-ring dispatches feed the same frame's
+    // draws: those stay on the graphics queue.
+    if (AsyncComputeMode() == 1) {
+        if (!liverpool->IsComputeRingActive()) {
+            return false;
+        }
+    } else {
+        // v1 mode (9) routed graphics-ring dispatches; compute rings stayed
+        // on the graphics queue. Keep that split for triage.
+        if (liverpool->IsComputeRingActive()) {
+            return false;
+        }
     }
-    if (!cs.images.empty() || !cs.samplers.empty()) {
-        return false;
-    }
-    // No heap allocation on the compute path: only push-descriptor pipelines route.
-    if (!pipeline.UsesPushDescriptors()) {
-        return false;
-    }
-    if (cs.uses_dma) {
+    // Buffers only: the images (layouts, barriers) are tracked for the graphics
+    // queue; the descriptors must be pushed (sets are recycled with it).
+    if (!cs.images.empty() || !cs.samplers.empty() || cs.uses_dma ||
+        !pipeline.UsesPushDescriptors()) {
         return false;
     }
     for (const auto& desc : cs.buffers) {
@@ -524,51 +530,81 @@ bool Rasterizer::IsAsyncComputeEligible(const ComputePipeline& pipeline, const S
 
 void Rasterizer::RouteComputeDispatch(const ComputePipeline* pipeline) {
     auto& stream = buffer_cache.GetStreamBuffer();
-    stream.SetPendingComputeTick(compute_queue.ReserveTick());
-    if (!BindResources(pipeline)) {
-        // Resolve the reservation so tagged watches complete: empty submit.
-        stream.SetPendingComputeTick(0);
+
+    // v1 per-dispatch mode (9): submit each dispatch separately. Kept for triage.
+    if (AsyncComputeMode() == 9) {
+        stream.SetPendingComputeTick(compute_queue.ReserveTick());
+        if (!BindResources(pipeline)) {
+            stream.SetPendingComputeTick(0);
+            FlushGraphicsForCompute();
+            compute_queue.Begin();
+            compute_queue.Submit(ComputeSubmitWaits());
+            ResetComputeBindings();
+            return;
+        }
         FlushGraphicsForCompute();
-        compute_queue.Begin();
-        compute_queue.Submit(ComputeSubmitWaits());
-        ResetComputeBindings();
-        return;
-    }
-    // Hand open graphics work (e.g. uploads recorded above) to the GPU first so
-    // the compute submission below can wait for an already-submitted tick.
-    FlushGraphicsForCompute();
-    const int ac_mode = AsyncComputeMode();
-    vk::CommandBuffer cb = compute_queue.Begin();
-    if (ac_mode == 1 || ac_mode >= 3) {
+        vk::CommandBuffer cb = compute_queue.Begin();
         cb.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
-    }
-    if (ac_mode == 1 || ac_mode >= 4) {
         cb.pushConstants(pipeline->GetLayout(), vk::ShaderStageFlagBits::eCompute, 0u,
                          sizeof(push_data), &push_data);
         if (!set_writes.empty()) {
             cb.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, pipeline->GetLayout(), 0u,
                                     set_writes);
         }
+        const auto& cs_program = liverpool->GetCsRegs();
+        cb.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
+        const u64 ctick = compute_queue.Submit(ComputeSubmitWaits());
+        const VideoCore::Buffer* stream_buf = &stream;
+        for (const auto [buffer, offset, size, is_written] : bound_buffers) {
+            (void)is_written;
+            if (!buffer || size == 0 || buffer == stream_buf) {
+                continue;
+            }
+            const VAddr base = buffer->cpu_addr + offset;
+            buffer_cache.NoteComputeWrites(base, base + size, ctick);
+        }
+        ResetComputeBindings();
+        scheduler.GetDynamicState().InvalidateComputePushConstants();
+        stream.SetPendingComputeTick(0);
+        DebugState.IncDispatch();
+        Common::Perf::Count(Common::Perf::Counter::Dispatches);
+        return;
     }
-    if (ac_mode == 1) {
+
+    // v2: batched. The game's compute-ring dispatches are collected in one
+    // command buffer through the frame and submitted at its end (or when a
+    // game thread reads back memory they wrote). Overlapping the next frame's
+    // draws is the point: the 14 ms of dispatches and 7.6 ms of draws of the
+    // fire scene add up serially today.
+    stream.SetPendingComputeTick(compute_queue.ReserveTick());
+    if (!BindResources(pipeline)) {
+        stream.SetPendingComputeTick(0);
+        ResetComputeBindings();
+        return;
+    }
+    if (!compute_batch_cb) {
+        // First dispatch of the batch: open it, remembering the graphics tick
+        // it waits for when submitted (the last submitted one, so it doesn't
+        // wait for work recorded after it in the same frame).
+        FlushGraphicsForCompute();
+        compute_batch_cb = compute_queue.Begin();
+        compute_batch_graphics_tick = scheduler.CurrentTick() > 0
+                                          ? scheduler.CurrentTick() - 1
+                                          : 0;
+        compute_batch_writes.clear();
+    }
+    compute_batch_cb.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
+    compute_batch_cb.pushConstants(pipeline->GetLayout(), vk::ShaderStageFlagBits::eCompute, 0u,
+                                   sizeof(push_data), &push_data);
+    if (!set_writes.empty()) {
+        compute_batch_cb.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute,
+                                               pipeline->GetLayout(), 0u, set_writes);
+    }
     const auto& cs_program = liverpool->GetCsRegs();
-    cb.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
-    const u64 ctick = compute_queue.Submit(ComputeSubmitWaits());
-    // Trace routed dispatches so a hang can be tied to its shader. Unthrottled
-    // while triaging the scene-load hang; every routed dispatch is logged with
-    // the tick it was submitted as (lines stop where the thread stops).
-    {
-        static std::atomic<u64> routed_count{0};
-        const u64 n = routed_count.fetch_add(1, std::memory_order_relaxed);
-        const auto& cs_info = pipeline->GetStage(Shader::SwStage::Compute);
-        LOG_INFO(Render_Vulkan, "Routed dispatch #{} submitted tick {}: cs {:#x} dims {}x{}x{}",
-                 n, ctick, cs_info.pgm_hash, cs_program.dim_x, cs_program.dim_y,
-                 cs_program.dim_z);
-    }
-    }
-    const u64 ctick = compute_queue.Submit(ComputeSubmitWaits());
-    // Tell graphics consumers overlapping these ranges to wait for this tick.
-    // Stream ranges are skipped: stream reuse is fenced by the watch mechanism.
+    compute_batch_cb.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
+
+    // Collect write ranges: noted for graphics consumers and the readback queue
+    // once the batch is submitted and its tick is known.
     const VideoCore::Buffer* stream_buf = &stream;
     for (const auto [buffer, offset, size, is_written] : bound_buffers) {
         (void)is_written;
@@ -576,15 +612,48 @@ void Rasterizer::RouteComputeDispatch(const ComputePipeline* pipeline) {
             continue;
         }
         const VAddr base = buffer->cpu_addr + offset;
-        buffer_cache.NoteComputeWrites(base, base + size, ctick);
+        compute_batch_writes.push_back({base, base + size});
     }
     ResetComputeBindings();
     // Push constants above bypassed the dynamic state tracking: the next
     // primary-buffer compute push must re-emit.
     scheduler.GetDynamicState().InvalidateComputePushConstants();
-    stream.SetPendingComputeTick(0);
     DebugState.IncDispatch();
     Common::Perf::Count(Common::Perf::Counter::Dispatches);
+}
+
+void Rasterizer::SubmitComputeBatch() {
+    if (!compute_batch_cb) {
+        return;
+    }
+    // The batch waits for the graphics tick it began at and the memory fence
+    // (sparse binds up to then). Its own earlier batches chain automatically.
+    std::vector<std::pair<vk::Semaphore, u64>> waits;
+    if (compute_batch_graphics_tick > 0) {
+        waits.emplace_back(scheduler.GetWorkSemaphore()->Handle(),
+                           compute_batch_graphics_tick);
+    }
+    if (const auto [sema, tick] = buffer_cache.MemoryFence(); sema && tick != 0) {
+        waits.emplace_back(sema, tick);
+    }
+    const u64 ctick = compute_queue.Submit(waits);
+    compute_batch_cb = vk::CommandBuffer{};
+    buffer_cache.GetStreamBuffer().SetPendingComputeTick(0);
+
+    // Tell graphics consumers overlapping these ranges to wait for this tick.
+    for (const auto& [start, end] : compute_batch_writes) {
+        buffer_cache.NoteComputeWrites(start, end, ctick);
+    }
+    compute_batch_writes.clear();
+
+    // Tell the readback queue the last write went to the compute timeline.
+    buffer_cache.NoteComputeWriteTick(ctick);
+
+    static std::atomic<u64> batch_count{0};
+    const u64 n = batch_count.fetch_add(1, std::memory_order_relaxed);
+    if (n < 5 || n % 100 == 0) {
+        LOG_INFO(Render_Vulkan, "Compute batch #{} submitted tick {}", n, ctick);
+    }
 }
 
 void Rasterizer::ResetComputeBindings() {

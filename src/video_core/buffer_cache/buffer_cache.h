@@ -107,6 +107,17 @@ public:
     /// bound. The readback copy waits for this tick, not for the latest one.
     void NoteGpuWriteTick() noexcept;
 
+    /// Notes the tick of the async compute batch that last wrote, so the
+    /// readback copy waits on the compute timeline instead of the graphics one.
+    void NoteComputeWriteTick(u64 tick) noexcept;
+
+    /// Registers a callback that submits the open compute batch. Called before
+    /// a readback that may cover memory the batch writes: its results aren't
+    /// available to a copy until it is submitted. GPU thread.
+    void SetComputeBatchFlusher(std::function<void()> flusher) noexcept {
+        compute_batch_flusher = std::move(flusher);
+    }
+
     /// Copies back GPU modified memory that game threads read back recently, before they read
     /// it again. Called when the game is signalled that GPU work is done.
     void PrefetchReadbacks();
@@ -460,6 +471,11 @@ private:
     /// Tick of the submission that last wrote to a GPU-bound buffer, so the readback
     /// copy waits for it rather than for the latest submission. GPU thread only.
     u64 last_write_tick{};
+    /// True when the last write went to the compute queue's timeline (async
+    /// compute batch), so the readback copy waits on that semaphore.
+    bool last_write_on_compute{};
+    /// Submits the open compute batch before a readback that covers its writes.
+    std::function<void()> compute_batch_flusher{};
     /// Declared after the staging pool and the tracker so it stops before they go away.
 };
 
