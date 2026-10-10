@@ -584,22 +584,34 @@ void Rasterizer::RouteComputeDispatch(const ComputePipeline* pipeline) {
     // game thread reads back memory they wrote). Overlapping the next frame's
     // draws is the point: the 14 ms of dispatches and 7.6 ms of draws of the
     // fire scene add up serially today.
+    //
+    // The batch breaks every MaxBatchDispatches so each one waits for graphics
+    // work close to its own dispatches: a shader reading memory uploaded a
+    // hundred dispatches ago would otherwise see data from before the upload.
+    static constexpr size_t MaxBatchDispatches = 64;
+    static size_t batch_dispatch_count = 0;
+
     stream.SetPendingComputeTick(compute_queue.ReserveTick());
     if (!BindResources(pipeline)) {
         stream.SetPendingComputeTick(0);
         ResetComputeBindings();
         return;
     }
-    if (!compute_batch_cb) {
-        // First dispatch of the batch: open it, remembering the graphics tick
-        // it waits for when submitted (the last submitted one, so it doesn't
-        // wait for work recorded after it in the same frame).
+    if (!compute_batch_cb || batch_dispatch_count >= MaxBatchDispatches) {
+        // Close the previous batch (its dispatches go to the compute queue with
+        // the graphics tick they began at) and open a new one.
+        if (compute_batch_cb) {
+            SubmitComputeBatch();
+            // A new batch: the stream commits in it get the next tick.
+            stream.SetPendingComputeTick(compute_queue.ReserveTick());
+        }
         FlushGraphicsForCompute();
         compute_batch_cb = compute_queue.Begin();
         compute_batch_graphics_tick = scheduler.CurrentTick() > 0
                                           ? scheduler.CurrentTick() - 1
                                           : 0;
         compute_batch_writes.clear();
+        batch_dispatch_count = 0;
     }
     compute_batch_cb.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
     compute_batch_cb.pushConstants(pipeline->GetLayout(), vk::ShaderStageFlagBits::eCompute, 0u,
@@ -628,6 +640,7 @@ void Rasterizer::RouteComputeDispatch(const ComputePipeline* pipeline) {
     scheduler.GetDynamicState().InvalidateComputePushConstants();
     DebugState.IncDispatch();
     Common::Perf::Count(Common::Perf::Counter::Dispatches);
+    ++batch_dispatch_count;
 }
 
 void Rasterizer::SubmitComputeBatch() {
